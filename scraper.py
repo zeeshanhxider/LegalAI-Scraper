@@ -25,7 +25,7 @@ from config import (
     REQUEST_DELAY_MIN, REQUEST_DELAY_MAX, REQUEST_TIMEOUT,
     MAX_RETRIES, RETRY_DELAY, MAX_RETRY_DELAY,
     OUTPUT_DIR, METADATA_FILENAME, CHECKPOINT_FILE,
-    COURT_LEVELS, PUB_STATUS
+    COURT_LEVELS, PUB_STATUS, OPINION_TYPES
 )
 
 # Setup logging
@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class OpinionMetadata:
     """Data class to store opinion metadata"""
+    opinion_type: str
     year: str
     month: str
     file_date: str
@@ -59,10 +60,23 @@ class OpinionMetadata:
 class WashingtonCourtsScraper:
     """Scraper for Washington State Courts opinions"""
     
-    def __init__(self, output_dir: str = OUTPUT_DIR, court_level: str = "S", pub_status: str = "PUB", resume: bool = True):
-        self.output_dir = output_dir
-        self.court_level = court_level  # S = Supreme Court, C = Court of Appeals
-        self.pub_status = pub_status    # PUB = Published, UNP = Unpublished
+    def __init__(self, output_dir: str = OUTPUT_DIR, opinion_type: str = "supreme_court", resume: bool = True):
+        self.base_output_dir = output_dir
+        self.opinion_type = opinion_type
+        
+        # Get settings from OPINION_TYPES config
+        if opinion_type not in OPINION_TYPES:
+            raise ValueError(f"Unknown opinion type: {opinion_type}. Valid types: {list(OPINION_TYPES.keys())}")
+        
+        type_config = OPINION_TYPES[opinion_type]
+        self.court_level = type_config["court_level"]
+        self.pub_status = type_config["pub_status"]
+        self.opinion_folder = type_config["folder"]
+        self.opinion_display_name = type_config["display_name"]
+        
+        # Set output directory to include opinion type folder
+        self.output_dir = os.path.join(output_dir, self.opinion_folder)
+        
         self.resume = resume
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -71,7 +85,7 @@ class WashingtonCourtsScraper:
         # Track downloaded files for resume capability
         self.downloaded_cases: Set[str] = set()
         self.failed_cases: Set[str] = set()  # Track failed downloads for retry
-        self.checkpoint_file = os.path.join(output_dir, CHECKPOINT_FILE)
+        self.checkpoint_file = os.path.join(self.output_dir, CHECKPOINT_FILE)
         
         # Graceful shutdown flag
         self.shutdown_requested = False
@@ -502,6 +516,7 @@ class WashingtonCourtsScraper:
                 
                 if not pdf_url:
                     metadata = OpinionMetadata(
+                        opinion_type=self.opinion_display_name,
                         year=year,
                         month=case['month'],
                         file_date=case['file_date'],
@@ -529,6 +544,7 @@ class WashingtonCourtsScraper:
                 success = self.download_pdf(pdf_url, save_path)
                 
                 metadata = OpinionMetadata(
+                    opinion_type=self.opinion_display_name,
                     year=year,
                     month=month,
                     file_date=case['file_date'],
@@ -556,6 +572,7 @@ class WashingtonCourtsScraper:
             except Exception as e:
                 logger.error(f"Error processing case {case.get('case_number', 'unknown')}: {e}")
                 metadata = OpinionMetadata(
+                    opinion_type=self.opinion_display_name,
                     year=year,
                     month=case.get('month', ''),
                     file_date=case.get('file_date', ''),

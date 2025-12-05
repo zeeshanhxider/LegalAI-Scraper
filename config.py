@@ -37,17 +37,46 @@ HEADERS = {
 OUTPUT_DIR = "downloads"
 METADATA_FILENAME = "metadata.csv"
 
-# Court levels
-COURT_LEVELS = {
-    "supreme_court": "S",           # Supreme Court
-    "court_of_appeals": "C",        # Court of Appeals (for future use)
+# Opinion Types Configuration
+# Each type has: court_level, pub_status, folder_name, display_name
+OPINION_TYPES = {
+    "supreme_court": {
+        "court_level": "S",
+        "pub_status": "PUB",
+        "folder": "Supreme_Court_Opinions",
+        "display_name": "Supreme Court Opinions"
+    },
+    "appeals_published": {
+        "court_level": "C",
+        "pub_status": "PUB",
+        "folder": "Court_of_Appeals_Published",
+        "display_name": "Court of Appeals - Published Opinions"
+    },
+    "appeals_partial": {
+        "court_level": "C",
+        "pub_status": "PAR",
+        "folder": "Court_of_Appeals_Published_in_Part",
+        "display_name": "Court of Appeals - Opinions Published in Part"
+    },
+    "appeals_unpublished": {
+        "court_level": "C",
+        "pub_status": "UNP",
+        "folder": "Court_of_Appeals_Unpublished",
+        "display_name": "Court of Appeals - Unpublished Opinions"
+    }
 }
 
-# Publication status
+# Court levels (legacy - for backwards compatibility)
+COURT_LEVELS = {
+    "supreme_court": "S",           # Supreme Court
+    "court_of_appeals": "C",        # Court of Appeals
+}
+
+# Publication status (legacy - for backwards compatibility)
 PUB_STATUS = {
     "published": "PUB",
     "unpublished": "UNP",
-    "partial": "PRP",  # Published in Part
+    "partial": "PIP",  # Published in Part
 }
 
 # Years to scrape (will be dynamically detected, but can be overridden)
