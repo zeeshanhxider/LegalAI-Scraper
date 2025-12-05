@@ -195,6 +195,9 @@ class WashingtonCourtsScraper:
             href = link.get('href', '')
             text = link.get_text(strip=True)
             
+            # Clean up text - remove pipe character and whitespace
+            text = text.replace('|', '').strip()
+            
             # Check if it's a year link for the specified court level
             if 'byYear' in href and f'crtLevel={self.court_level}' in href and re.match(r'^\d{4}$', text):
                 years.append(text)
