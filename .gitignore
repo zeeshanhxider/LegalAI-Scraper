@@ -1,0 +1,32 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Downloads and output
+downloads/
+test_downloads/
+test_run/
+
+# Checkpoints and logs
+scraper_checkpoint.json
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Metadata (optional - uncomment if you want to track it)
+# metadata.csv
