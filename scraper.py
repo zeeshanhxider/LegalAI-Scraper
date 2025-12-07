@@ -49,6 +49,7 @@ class OpinionMetadata:
     month: str
     file_date: str
     case_number: str
+    division: str
     case_title: str
     file_contains: str
     case_info_url: str
@@ -149,6 +150,11 @@ class WashingtonCourtsScraper:
                     response = self.session.get(url, timeout=REQUEST_TIMEOUT)
                 
                 response.raise_for_status()
+                
+                # Ensure proper encoding for HTML responses
+                if not is_pdf:
+                    response.encoding = 'utf-8'
+                
                 return response
                 
             except requests.exceptions.ConnectionError as e:
@@ -250,7 +256,7 @@ class WashingtonCourtsScraper:
             
             for row in rows[1:]:  # Skip header row
                 cells = row.find_all('td')
-                if len(cells) >= 3:
+                if len(cells) >= 4:
                     try:
                         file_date = cells[0].get_text(strip=True)
                         
@@ -263,10 +269,23 @@ class WashingtonCourtsScraper:
                         case_number = case_link.get_text(strip=True) if case_link else case_cell.get_text(strip=True)
                         case_info_url = urljoin(BASE_URL, case_link.get('href')) if case_link else ""
                         
-                        case_title = cells[2].get_text(strip=True)
-                        case_title = re.sub(r'^\*\s*', '', case_title)
+                        # Court of Appeals has 5 columns (with Division), Supreme Court has 4
+                        # Check if cell[2] is a Division (I, II, III) or a case title
+                        cell2_text = cells[2].get_text(strip=True)
                         
-                        file_contains = cells[3].get_text(strip=True) if len(cells) > 3 else ""
+                        if len(cells) >= 5 and cell2_text in ['I', 'II', 'III']:
+                            # Court of Appeals format: Date, Case#, Div, Title, Contains
+                            division = cell2_text
+                            case_title = cells[3].get_text(strip=True)
+                            file_contains = cells[4].get_text(strip=True) if len(cells) > 4 else ""
+                        else:
+                            # Supreme Court format: Date, Case#, Title, Contains
+                            division = ""
+                            case_title = cell2_text
+                            file_contains = cells[3].get_text(strip=True) if len(cells) > 3 else ""
+                        
+                        # Remove leading asterisk from case title
+                        case_title = re.sub(r'^\*\s*', '', case_title)
                         
                         if case_number and case_info_url:
                             all_cases.append({
@@ -274,6 +293,7 @@ class WashingtonCourtsScraper:
                                 'month': month,
                                 'file_date': file_date,
                                 'case_number': case_number,
+                                'division': division,
                                 'case_title': case_title,
                                 'file_contains': file_contains,
                                 'case_info_url': case_info_url
@@ -524,6 +544,7 @@ class WashingtonCourtsScraper:
                         month=case['month'],
                         file_date=case['file_date'],
                         case_number=case['case_number'],
+                        division=case.get('division', ''),
                         case_title=case['case_title'],
                         file_contains=case['file_contains'],
                         case_info_url=case['case_info_url'],
@@ -553,6 +574,7 @@ class WashingtonCourtsScraper:
                     month=month,
                     file_date=case['file_date'],
                     case_number=case['case_number'],
+                    division=case.get('division', ''),
                     case_title=case['case_title'],
                     file_contains=case['file_contains'],
                     case_info_url=case['case_info_url'],
@@ -582,6 +604,7 @@ class WashingtonCourtsScraper:
                     month=case.get('month', ''),
                     file_date=case.get('file_date', ''),
                     case_number=case.get('case_number', ''),
+                    division=case.get('division', ''),
                     case_title=case.get('case_title', ''),
                     file_contains=case.get('file_contains', ''),
                     case_info_url=case.get('case_info_url', ''),
