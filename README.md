@@ -120,20 +120,21 @@ downloads/
 
 ## Metadata CSV Columns
 
-| Column          | Description                            |
-| --------------- | -------------------------------------- |
-| opinion_type    | Type of opinion (Supreme Court, etc.)  |
-| year            | Filing year                            |
-| month           | Filing month                           |
-| file_date       | Original file date                     |
-| case_number     | Court case number                      |
-| case_title      | Case name (e.g., "State v. Smith")     |
-| file_contains   | Opinion type (Majority, Dissent, etc.) |
-| case_info_url   | Link to case info page                 |
-| pdf_url         | Direct PDF download URL                |
-| pdf_filename    | Local filename                         |
-| download_status | Success/Failed                         |
-| scraped_at      | Timestamp                              |
+| Column             | Description                                        |
+| ------------------ | -------------------------------------------------- |
+| opinion_type       | Court type: "Supreme Court" or "Court of Appeals"  |
+| publication_status | "Published", "Unpublished", or "Published in Part" |
+| year               | Filing year                                        |
+| month              | Filing month                                       |
+| file_date          | Original file date                                 |
+| case_number        | Court case number                                  |
+| case_title         | Case name (e.g., "State v. Smith")                 |
+| file_contains      | Opinion type (Majority, Dissent, etc.)             |
+| case_info_url      | Link to case info page                             |
+| pdf_url            | Direct PDF download URL                            |
+| pdf_filename       | Local filename                                     |
+| download_status    | Success/Failed                                     |
+| scraped_at         | Timestamp                                          |
 
 ## Running Overnight
 

@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 class OpinionMetadata:
     """Data class to store opinion metadata"""
     opinion_type: str
+    publication_status: str
     year: str
     month: str
     file_date: str
@@ -72,7 +73,8 @@ class WashingtonCourtsScraper:
         self.court_level = type_config["court_level"]
         self.pub_status = type_config["pub_status"]
         self.opinion_folder = type_config["folder"]
-        self.opinion_display_name = type_config["display_name"]
+        self.opinion_type_name = type_config["opinion_type"]
+        self.publication_status = type_config["publication_status"]
         
         # Set output directory to include opinion type folder
         self.output_dir = os.path.join(output_dir, self.opinion_folder)
@@ -516,7 +518,8 @@ class WashingtonCourtsScraper:
                 
                 if not pdf_url:
                     metadata = OpinionMetadata(
-                        opinion_type=self.opinion_display_name,
+                        opinion_type=self.opinion_type_name,
+                        publication_status=self.publication_status,
                         year=year,
                         month=case['month'],
                         file_date=case['file_date'],
@@ -544,7 +547,8 @@ class WashingtonCourtsScraper:
                 success = self.download_pdf(pdf_url, save_path)
                 
                 metadata = OpinionMetadata(
-                    opinion_type=self.opinion_display_name,
+                    opinion_type=self.opinion_type_name,
+                    publication_status=self.publication_status,
                     year=year,
                     month=month,
                     file_date=case['file_date'],
@@ -572,7 +576,8 @@ class WashingtonCourtsScraper:
             except Exception as e:
                 logger.error(f"Error processing case {case.get('case_number', 'unknown')}: {e}")
                 metadata = OpinionMetadata(
-                    opinion_type=self.opinion_display_name,
+                    opinion_type=self.opinion_type_name,
+                    publication_status=self.publication_status,
                     year=year,
                     month=case.get('month', ''),
                     file_date=case.get('file_date', ''),

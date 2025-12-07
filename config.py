@@ -38,31 +38,35 @@ OUTPUT_DIR = "downloads"
 METADATA_FILENAME = "metadata.csv"
 
 # Opinion Types Configuration
-# Each type has: court_level, pub_status, folder_name, display_name
+# Each type has: court_level, pub_status, folder_name, opinion_type, publication_status
 OPINION_TYPES = {
     "supreme_court": {
         "court_level": "S",
         "pub_status": "PUB",
         "folder": "Supreme_Court_Opinions",
-        "display_name": "Supreme Court Opinions"
+        "opinion_type": "Supreme Court",
+        "publication_status": "Published"
     },
     "appeals_published": {
         "court_level": "C",
         "pub_status": "PUB",
         "folder": "Court_of_Appeals_Published",
-        "display_name": "Court of Appeals - Published Opinions"
+        "opinion_type": "Court of Appeals",
+        "publication_status": "Published"
     },
     "appeals_partial": {
         "court_level": "C",
         "pub_status": "PAR",
         "folder": "Court_of_Appeals_Published_in_Part",
-        "display_name": "Court of Appeals - Opinions Published in Part"
+        "opinion_type": "Court of Appeals",
+        "publication_status": "Published in Part"
     },
     "appeals_unpublished": {
         "court_level": "C",
         "pub_status": "UNP",
         "folder": "Court_of_Appeals_Unpublished",
-        "display_name": "Court of Appeals - Unpublished Opinions"
+        "opinion_type": "Court of Appeals",
+        "publication_status": "Unpublished"
     }
 }
 

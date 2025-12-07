@@ -112,7 +112,8 @@ Examples:
     # Process each opinion type
     for opinion_type in opinion_types:
         print(f"\n{'='*60}")
-        print(f"Processing: {OPINION_TYPES[opinion_type]['display_name']}")
+        type_config = OPINION_TYPES[opinion_type]
+        print(f"Processing: {type_config['opinion_type']} - {type_config['publication_status']}")
         print(f"{'='*60}")
         
         # Initialize scraper with resume option
@@ -150,7 +151,7 @@ Examples:
         # Run the scraper
         scraper.run(years=years_to_scrape)
         
-        print(f"\nCompleted: {OPINION_TYPES[opinion_type]['display_name']}")
+        print(f"\nCompleted: {OPINION_TYPES[opinion_type]['opinion_type']} - {OPINION_TYPES[opinion_type]['publication_status']}")
         print(f"PDFs saved to: {scraper.output_dir}/")
         print(f"Metadata saved to: {scraper.output_dir}/metadata.csv")
     
@@ -179,9 +180,10 @@ def count_all_opinion_types(base_output_dir: str):
     for type_key, type_config in OPINION_TYPES.items():
         court_level = type_config["court_level"]
         pub_status = type_config["pub_status"]
-        display_name = type_config["display_name"]
+        opinion_type = type_config["opinion_type"]
+        pub_status_name = type_config["publication_status"]
         
-        print(f"\n{display_name}")
+        print(f"\n{opinion_type} - {pub_status_name}")
         print("-" * 50)
         
         # Get years for this type
