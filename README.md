@@ -102,6 +102,7 @@ downloads/
 │   ├── 2025/
 │   │   ├── January/
 │   │   │   ├── 102586-6_Case Title.pdf
+│   │   │   ├── 102586-6_info.html          ← Opinion Info Sheet
 │   │   │   └── ...
 │   │   ├── February/
 │   │   └── ...
@@ -118,6 +119,33 @@ downloads/
     └── ...
 ```
 
+## Opinion Information Sheets
+
+In addition to PDFs, you can download the "Opinion Information Sheet" HTML pages that contain detailed case information including:
+
+- Docket Number, Title, File Date, Oral Argument Date
+- Source of Appeal (Court, Docket No, Judge)
+- Justices and their votes (Majority, Dissent, Concurrence)
+- Counsel for all parties (Petitioner, Respondent, Amicus Curiae)
+
+### Download Info Sheets
+
+```bash
+# Download info sheets for all cases (uses 3 parallel workers)
+python scrape_info_sheets.py
+
+# Specific opinion type
+python scrape_info_sheets.py --type supreme_court
+
+# Adjust parallel workers (default: 3, increase for faster downloads)
+python scrape_info_sheets.py --workers 5
+
+# Start fresh
+python scrape_info_sheets.py --no-resume
+```
+
+Info sheets are saved as `{case_number}_info.html` alongside the PDF files.
+
 ## Metadata CSV Columns
 
 | Column             | Description                                        |
@@ -128,6 +156,7 @@ downloads/
 | month              | Filing month                                       |
 | file_date          | Original file date                                 |
 | case_number        | Court case number                                  |
+| division           | Court of Appeals Division (I, II, III) or empty    |
 | case_title         | Case name (e.g., "State v. Smith")                 |
 | file_contains      | Opinion type (Majority, Dissent, etc.)             |
 | case_info_url      | Link to case info page                             |
