@@ -30,3 +30,5 @@ Thumbs.db
 
 # Metadata (optional - uncomment if you want to track it)
 # metadata.csv
+/bin
+/lib
