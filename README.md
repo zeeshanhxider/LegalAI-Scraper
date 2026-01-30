@@ -11,6 +11,7 @@ A Python scraper for downloading court opinions from the Washington State Courts
   - Court of Appeals - Unpublished Opinions
 - Saves PDFs organized by Opinion Type/Year/Month folders
 - Generates metadata CSV with case details (including opinion type)
+- **Parallel processing** - downloads multiple PDFs simultaneously for faster scraping
 - **Resume capability** - automatically continues from where it stopped
 - **Failproof** - retries failed downloads, handles network issues
 - **Graceful shutdown** - press Ctrl+C to stop safely
@@ -81,6 +82,12 @@ python run_scraper.py --count-all
 # Scrape specific years
 python run_scraper.py --type supreme_court --years 2023 2024 2025
 
+# Use parallel workers for faster downloads (default: 5)
+python run_scraper.py --type appeals_unpublished --years 2013 2014 2015 2016 --workers 10
+
+# Maximum speed with 15 parallel workers
+python run_scraper.py --type appeals_unpublished --years 2018 --workers 15
+
 # List available years for an opinion type
 python run_scraper.py --type appeals_published --list-years
 
@@ -131,14 +138,17 @@ In addition to PDFs, you can download the "Opinion Information Sheet" HTML pages
 ### Download Info Sheets
 
 ```bash
-# Download info sheets for all cases (uses 3 parallel workers)
+# Download info sheets for all cases (uses 3 parallel workers by default)
 python scrape_info_sheets.py
 
 # Specific opinion type
 python scrape_info_sheets.py --type supreme_court
 
-# Adjust parallel workers (default: 3, increase for faster downloads)
-python scrape_info_sheets.py --workers 5
+# Increase parallel workers for faster downloads (recommended: 10-15)
+python scrape_info_sheets.py --type appeals_unpublished --workers 10
+
+# Maximum speed with 20 workers
+python scrape_info_sheets.py --type appeals_unpublished --workers 20
 
 # Start fresh
 python scrape_info_sheets.py --no-resume
@@ -183,9 +193,39 @@ python run_scraper.py --type all
 
 Edit `config.py` to adjust:
 
-- Request delays (default: 1-2 seconds between requests)
+- Request delays (default: 0.3-0.5 seconds between requests for faster bulk scraping)
 - Retry settings (default: 5 retries with exponential backoff)
 - Timeout settings (default: 30 seconds)
+- Parallel workers (default: 5 for PDFs, 3 for info sheets)
+
+## Performance Tips
+
+**For Maximum Speed:**
+
+```bash
+# Use high worker counts for bulk downloads
+python run_scraper.py --type appeals_unpublished --years 2013 2014 2015 --workers 15
+
+# For info sheets, use even higher worker counts
+python scrape_info_sheets.py --type appeals_unpublished --workers 20
+```
+
+**Parallel Downloads Across Years:**
+
+Run multiple terminals simultaneously, one year per terminal:
+
+```bash
+# Terminal 1
+python run_scraper.py --type appeals_unpublished --years 2013 --workers 10
+
+# Terminal 2
+python run_scraper.py --type appeals_unpublished --years 2014 --workers 10
+
+# Terminal 3
+python run_scraper.py --type appeals_unpublished --years 2015 --workers 10
+```
+
+This approach can download 6 years of data simultaneously.
 
 ## Files
 

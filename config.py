@@ -13,8 +13,8 @@ OPINIONS_URL = f"{BASE_URL}/opinions/index.cfm"
 # PDF: /opinions/pdf/871051.pdf
 
 # Request settings
-REQUEST_DELAY_MIN = 1.0  # Minimum seconds between requests
-REQUEST_DELAY_MAX = 2.0  # Maximum seconds between requests
+REQUEST_DELAY_MIN = 0.3  # Minimum seconds between requests (faster for bulk scraping)
+REQUEST_DELAY_MAX = 0.5  # Maximum seconds between requests (faster for bulk scraping)
 REQUEST_TIMEOUT = 30  # Timeout for requests in seconds
 
 # Retry settings

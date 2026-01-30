@@ -17,8 +17,10 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Tuple
 from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 from config import (
     BASE_URL, OPINIONS_URL, HEADERS,
@@ -62,9 +64,11 @@ class OpinionMetadata:
 class WashingtonCourtsScraper:
     """Scraper for Washington State Courts opinions"""
     
-    def __init__(self, output_dir: str = OUTPUT_DIR, opinion_type: str = "supreme_court", resume: bool = True):
+    def __init__(self, output_dir: str = OUTPUT_DIR, opinion_type: str = "supreme_court", resume: bool = True, workers: int = 5):
         self.base_output_dir = output_dir
         self.opinion_type = opinion_type
+        self.workers = workers
+        self.lock = Lock()  # Thread-safe operations
         
         # Get settings from OPINION_TYPES config
         if opinion_type not in OPINION_TYPES:
@@ -81,8 +85,7 @@ class WashingtonCourtsScraper:
         self.output_dir = os.path.join(output_dir, self.opinion_folder)
         
         self.resume = resume
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+        # Don't create shared session - each thread will create its own
         self.metadata_records: List[OpinionMetadata] = []
         
         # Track downloaded files for resume capability
@@ -138,16 +141,20 @@ class WashingtonCourtsScraper:
         time.sleep(delay)
         
     def _make_request(self, url: str, retries: int = MAX_RETRIES, is_pdf: bool = False) -> Optional[requests.Response]:
-        """Make HTTP request with exponential backoff retry logic"""
+        """Make HTTP request with exponential backoff retry logic - creates session per call for thread safety"""
+        # Create a new session for this request (thread-safe)
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        
         for attempt in range(retries):
             try:
                 self._delay()
                 
                 # For PDF downloads, use stream mode
                 if is_pdf:
-                    response = self.session.get(url, timeout=REQUEST_TIMEOUT * 2, stream=True)
+                    response = session.get(url, timeout=REQUEST_TIMEOUT * 2, stream=True)
                 else:
-                    response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                    response = session.get(url, timeout=REQUEST_TIMEOUT)
                 
                 response.raise_for_status()
                 
@@ -155,6 +162,7 @@ class WashingtonCourtsScraper:
                 if not is_pdf:
                     response.encoding = 'utf-8'
                 
+                session.close()
                 return response
                 
             except requests.exceptions.ConnectionError as e:
@@ -164,9 +172,6 @@ class WashingtonCourtsScraper:
                 logger.warning(f"Waiting {retry_delay}s before retry...")
                 if attempt < retries - 1:
                     time.sleep(retry_delay)
-                    # Recreate session on connection errors
-                    self.session = requests.Session()
-                    self.session.headers.update(HEADERS)
                     
             except requests.exceptions.Timeout as e:
                 retry_delay = min(RETRY_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
@@ -186,6 +191,7 @@ class WashingtonCourtsScraper:
                         time.sleep(retry_delay)
                 else:
                     logger.error(f"HTTP error {e.response.status_code}: {url}")
+                    session.close()
                     return None
                     
             except requests.RequestException as e:
@@ -194,6 +200,7 @@ class WashingtonCourtsScraper:
                 if attempt < retries - 1:
                     time.sleep(retry_delay)
         
+        session.close()
         logger.error(f"All {retries} retries failed for: {url}")
         return None
     
@@ -504,116 +511,150 @@ class WashingtonCourtsScraper:
             filename = filename[:200]
         return filename
     
-    def scrape_year(self, year: str) -> List[OpinionMetadata]:
-        """Scrape all opinions for a given year"""
-        logger.info(f"Starting scrape for year {year}")
-        year_metadata = []
+    def _process_single_case(self, case: Dict[str, Any], year: str, case_index: int, total_cases: int) -> Tuple[Optional[OpinionMetadata], bool]:
+        """Process a single case - used by parallel executor. Returns (metadata, success)"""
+        case_id = f"{year}_{case['case_number']}"
         
-        cases = self.get_cases_for_year(year)
+        # Skip if already successfully processed (resume capability)
+        if self.resume and case_id in self.downloaded_cases:
+            logger.info(f"Skipping already processed case {case_index+1}/{total_cases}: {case['case_number']}")
+            return None, True
         
-        for i, case in enumerate(cases):
-            # Check for shutdown request
-            if self.shutdown_requested:
-                logger.warning("Shutdown requested, stopping gracefully...")
-                break
+        # If it was a failed case before, we're retrying it
+        is_retry = case_id in self.failed_cases
+        if is_retry:
+            logger.info(f"Retrying previously failed case {case_index+1}/{total_cases}: {case['case_number']}")
+            with self.lock:
+                self.failed_cases.discard(case_id)
+        else:
+            logger.info(f"Processing case {case_index+1}/{total_cases}: {case['case_number']}")
+        
+        try:
+            # Get PDF URL from case info page
+            pdf_url = self.get_pdf_url(case['case_info_url'])
             
-            case_id = f"{year}_{case['case_number']}"
-            
-            # Skip if already successfully processed (resume capability)
-            if self.resume and case_id in self.downloaded_cases:
-                logger.info(f"Skipping already processed case {i+1}/{len(cases)}: {case['case_number']}")
-                continue
-            
-            # If it was a failed case before, we're retrying it
-            is_retry = case_id in self.failed_cases
-            if is_retry:
-                logger.info(f"Retrying previously failed case {i+1}/{len(cases)}: {case['case_number']}")
-                self.failed_cases.discard(case_id)  # Remove from failed set for this attempt
-            else:
-                logger.info(f"Processing case {i+1}/{len(cases)}: {case['case_number']}")
-            
-            try:
-                # Get PDF URL from case info page
-                pdf_url = self.get_pdf_url(case['case_info_url'])
-                
-                if not pdf_url:
-                    metadata = OpinionMetadata(
-                        opinion_type=self.opinion_type_name,
-                        publication_status=self.publication_status,
-                        year=year,
-                        month=case['month'],
-                        file_date=case['file_date'],
-                        case_number=case['case_number'],
-                        division=case.get('division', ''),
-                        case_title=case['case_title'],
-                        file_contains=case['file_contains'],
-                        case_info_url=case['case_info_url'],
-                        pdf_url="",
-                        pdf_filename="",
-                        download_status="PDF URL not found",
-                        scraped_at=datetime.now().isoformat()
-                    )
-                    year_metadata.append(metadata)
-                    self.downloaded_cases.add(case_id)
-                    continue
-                
-                # Create filename and path
-                safe_title = self.sanitize_filename(case['case_title'])[:50]
-                pdf_filename = f"{case['case_number']}_{safe_title}.pdf"
-                month = case['month'] or "Unknown"
-                save_dir = os.path.join(self.output_dir, year, month)
-                save_path = os.path.join(save_dir, pdf_filename)
-                
-                # Download PDF
-                success = self.download_pdf(pdf_url, save_path)
-                
+            if not pdf_url:
                 metadata = OpinionMetadata(
                     opinion_type=self.opinion_type_name,
                     publication_status=self.publication_status,
                     year=year,
-                    month=month,
+                    month=case['month'],
                     file_date=case['file_date'],
                     case_number=case['case_number'],
                     division=case.get('division', ''),
                     case_title=case['case_title'],
                     file_contains=case['file_contains'],
                     case_info_url=case['case_info_url'],
-                    pdf_url=pdf_url,
-                    pdf_filename=pdf_filename if success else "",
-                    download_status="Success" if success else "Download failed - will retry",
-                    scraped_at=datetime.now().isoformat()
-                )
-                year_metadata.append(metadata)
-                
-                if success:
-                    self.downloaded_cases.add(case_id)
-                    # Save checkpoint periodically (every 10 successful downloads)
-                    if len(self.downloaded_cases) % 10 == 0:
-                        self._save_checkpoint()
-                else:
-                    # Track failed case for retry on next run
-                    self.failed_cases.add(case_id)
-                    logger.warning(f"Failed to download {case['case_number']} - will retry on next run")
-                
-            except Exception as e:
-                logger.error(f"Error processing case {case.get('case_number', 'unknown')}: {e}")
-                metadata = OpinionMetadata(
-                    opinion_type=self.opinion_type_name,
-                    publication_status=self.publication_status,
-                    year=year,
-                    month=case.get('month', ''),
-                    file_date=case.get('file_date', ''),
-                    case_number=case.get('case_number', ''),
-                    division=case.get('division', ''),
-                    case_title=case.get('case_title', ''),
-                    file_contains=case.get('file_contains', ''),
-                    case_info_url=case.get('case_info_url', ''),
                     pdf_url="",
                     pdf_filename="",
-                    download_status=f"Error: {str(e)}",
+                    download_status="PDF URL not found",
                     scraped_at=datetime.now().isoformat()
                 )
-                year_metadata.append(metadata)
+                with self.lock:
+                    self.downloaded_cases.add(case_id)
+                return metadata, True
+            
+            # Create filename and path
+            safe_title = self.sanitize_filename(case['case_title'])[:50]
+            pdf_filename = f"{case['case_number']}_{safe_title}.pdf"
+            month = case['month'] or "Unknown"
+            save_dir = os.path.join(self.output_dir, year, month)
+            save_path = os.path.join(save_dir, pdf_filename)
+            
+            # Download PDF
+            success = self.download_pdf(pdf_url, save_path)
+            
+            metadata = OpinionMetadata(
+                opinion_type=self.opinion_type_name,
+                publication_status=self.publication_status,
+                year=year,
+                month=month,
+                file_date=case['file_date'],
+                case_number=case['case_number'],
+                division=case.get('division', ''),
+                case_title=case['case_title'],
+                file_contains=case['file_contains'],
+                case_info_url=case['case_info_url'],
+                pdf_url=pdf_url,
+                pdf_filename=pdf_filename if success else "",
+                download_status="Success" if success else "Download failed - will retry",
+                scraped_at=datetime.now().isoformat()
+            )
+            
+            with self.lock:
+                if success:
+                    self.downloaded_cases.add(case_id)
+                    # Save checkpoint periodically (every 50 successful downloads)
+                    if len(self.downloaded_cases) % 50 == 0:
+                        self._save_checkpoint()
+                else:
+                    self.failed_cases.add(case_id)
+                    logger.warning(f"Failed to download {case['case_number']} - will retry on next run")
+            
+            return metadata, success
+            
+        except Exception as e:
+            logger.error(f"Error processing case {case.get('case_number', 'unknown')}: {e}")
+            metadata = OpinionMetadata(
+                opinion_type=self.opinion_type_name,
+                publication_status=self.publication_status,
+                year=year,
+                month=case.get('month', ''),
+                file_date=case.get('file_date', ''),
+                case_number=case.get('case_number', ''),
+                division=case.get('division', ''),
+                case_title=case.get('case_title', ''),
+                file_contains=case.get('file_contains', ''),
+                case_info_url=case.get('case_info_url', ''),
+                pdf_url="",
+                pdf_filename="",
+                download_status=f"Error: {str(e)}",
+                scraped_at=datetime.now().isoformat()
+            )
+            return metadata, False
+
+    def scrape_year(self, year: str) -> List[OpinionMetadata]:
+        """Scrape all opinions for a given year using parallel processing"""
+        logger.info(f"Starting scrape for year {year} with {self.workers} workers")
+        year_metadata = []
+        
+        cases = self.get_cases_for_year(year)
+        total_cases = len(cases)
+        
+        # Filter out already processed cases for better progress tracking
+        cases_to_process = []
+        for i, case in enumerate(cases):
+            case_id = f"{year}_{case['case_number']}"
+            if not (self.resume and case_id in self.downloaded_cases):
+                cases_to_process.append((case, i))
+        
+        if not cases_to_process:
+            logger.info(f"All {total_cases} cases already processed for year {year}")
+            return year_metadata
+        
+        logger.info(f"Processing {len(cases_to_process)} cases (skipping {total_cases - len(cases_to_process)} already done)")
+        
+        # Use ThreadPoolExecutor for parallel downloads
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            # Submit all tasks
+            future_to_case = {
+                executor.submit(self._process_single_case, case, year, idx, total_cases): case
+                for case, idx in cases_to_process
+            }
+            
+            # Process results as they complete
+            for future in as_completed(future_to_case):
+                if self.shutdown_requested:
+                    logger.warning("Shutdown requested, cancelling remaining tasks...")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                
+                try:
+                    metadata, success = future.result()
+                    if metadata:
+                        year_metadata.append(metadata)
+                except Exception as e:
+                    logger.error(f"Task failed with exception: {e}")
         
         # Save checkpoint after each year
         self._save_checkpoint()

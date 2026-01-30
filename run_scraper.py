@@ -91,6 +91,13 @@ Examples:
     )
     
     parser.add_argument(
+        '--workers',
+        type=int,
+        default=5,
+        help='Number of parallel workers for downloading (default: 5)'
+    )
+    
+    parser.add_argument(
         '--count-all',
         action='store_true',
         help='Count cases for all opinion types without downloading'
@@ -121,7 +128,8 @@ Examples:
         scraper = WashingtonCourtsScraper(
             output_dir=args.output, 
             opinion_type=opinion_type,
-            resume=resume
+            resume=resume,
+            workers=args.workers
         )
         
         # List years only
