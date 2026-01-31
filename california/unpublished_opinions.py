@@ -16,19 +16,19 @@ from urllib3.util.retry import Retry
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError  # type: ignore
 
 
-SEARCH_BASE_URL = "https://courts.ca.gov/opinions/publishedcitable-opinions"
+SEARCH_BASE_URL = "https://courts.ca.gov/opinions/unpublishednon-citable-opinions"
 CASE_BASE_URL = "https://appellatecases.courtinfo.ca.gov"
 
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
-DOWNLOAD_ROOT = ROOT / "downloads" / "published_opinions" / "download"
-META_DIR = ROOT / "downloads" / "published_opinions"
+DOWNLOAD_ROOT = ROOT / "downloads" / "unpublished_opinions" / "download"
+META_DIR = ROOT / "downloads" / "unpublished_opinions"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 META_DIR.mkdir(parents=True, exist_ok=True)
 
-LOG_FILE = LOG_DIR / f"published-opinions-{datetime.date.today():%Y%m%d}.log"
+LOG_FILE = LOG_DIR / f"unpublished-opinions-{datetime.date.today():%Y%m%d}.log"
 CSV_FILE = META_DIR / f"{datetime.date.today():%Y%m%d}-metadata.csv"
 
 logging.basicConfig(
