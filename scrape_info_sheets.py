@@ -74,9 +74,10 @@ except ValueError:
 class InfoSheetScraper:
     """Scraper for Opinion Information Sheet HTML pages"""
     
-    def __init__(self, opinion_type: str, resume: bool = True, workers: int = 3):
+    def __init__(self, opinion_type: str, resume: bool = True, workers: int = 3, years: Optional[List[str]] = None):
         self.opinion_type = opinion_type
         self.workers = workers
+        self.years = years  # Filter by specific years if provided
         
         if opinion_type not in OPINION_TYPES:
             raise ValueError(f"Unknown opinion type: {opinion_type}")
@@ -176,9 +177,14 @@ class InfoSheetScraper:
         with open(metadata_path, 'r', encoding='utf-8', newline='') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                cases.append(row)
+                # Filter by year if specified
+                if self.years is None or row.get('year', '') in self.years:
+                    cases.append(row)
         
-        logger.info(f"Loaded {len(cases)} cases from metadata")
+        if self.years:
+            logger.info(f"Loaded {len(cases)} cases from metadata (filtered to years: {', '.join(self.years)})")
+        else:
+            logger.info(f"Loaded {len(cases)} cases from metadata")
         return cases
     
     def download_info_sheet(self, case: Dict) -> bool:
@@ -319,14 +325,15 @@ class InfoSheetScraper:
         return stats
 
 
-def process_opinion_type(opinion_type: str, resume: bool, workers: int) -> Dict[str, int]:
+def process_opinion_type(opinion_type: str, resume: bool, workers: int, years: Optional[List[str]] = None) -> Dict[str, int]:
     """Process a single opinion type (for parallel execution)"""
     print(f"\n[{opinion_type}] Starting...")
     
     scraper = InfoSheetScraper(
         opinion_type=opinion_type,
         resume=resume,
-        workers=workers
+        workers=workers,
+        years=years
     )
     
     stats = scraper.scrape()
@@ -339,6 +346,7 @@ def main():
     parser = argparse.ArgumentParser(description="Download Opinion Information Sheet HTML pages")
     parser.add_argument('--type', choices=['supreme_court', 'appeals_published', 'appeals_partial', 'appeals_unpublished', 'all'],
                         default='all', help='Opinion type to process')
+    parser.add_argument('--years', nargs='+', help='Specific years to process (e.g., 2023 2024 2025)')
     parser.add_argument('--no-resume', action='store_true', help='Start fresh, ignore checkpoint')
     parser.add_argument('--workers', type=int, default=3, help='Number of parallel workers per opinion type (default: 3)')
     parser.add_argument('--sequential', action='store_true', help='Process opinion types sequentially instead of in parallel')
@@ -360,7 +368,7 @@ def main():
             print(f"Processing: {OPINION_TYPES[opinion_type]['folder']}")
             print("=" * 60)
             
-            stats = process_opinion_type(opinion_type, not args.no_resume, args.workers)
+            stats = process_opinion_type(opinion_type, not args.no_resume, args.workers, args.years)
             
             for key in total_stats:
                 total_stats[key] += stats[key]
@@ -373,7 +381,7 @@ def main():
         
         with ThreadPoolExecutor(max_workers=len(types_to_process)) as executor:
             futures = {
-                executor.submit(process_opinion_type, opinion_type, not args.no_resume, args.workers): opinion_type
+                executor.submit(process_opinion_type, opinion_type, not args.no_resume, args.workers, args.years): opinion_type
                 for opinion_type in types_to_process
             }
             
