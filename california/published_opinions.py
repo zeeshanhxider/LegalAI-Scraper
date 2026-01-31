@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-Requirements implemented:
-
-1) Save HTML + PNG in SAME folder as PDF:
-   downloads/published_opinions/download/<case_number>/
-
-2) Do NOT save listing page (courts.ca.gov/opinions/publishedcitable-opinions)
-   Only save the case page opened by title <a> link (appellatecases.courtinfo.ca.gov)
-
-3) For each case:
-   - Find the title <a> on listing page
-   - Get href
-   - Open that href (case detail page)
-   - Save HTML and PNG from THAT page
-"""
-
-from __future__ import annotations
 
 import argparse
 import csv
@@ -24,26 +7,39 @@ import logging
 import re
 import time
 from pathlib import Path
-from urllib.parse import urlencode, urljoin, urlparse, parse_qsl
+from urllib.parse import urlencode, urljoin, urlparse, parse_qsl, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError  # type: ignore
+
 
 SEARCH_BASE_URL = "https://courts.ca.gov/opinions/publishedcitable-opinions"
 CASE_BASE_URL = "https://appellatecases.courtinfo.ca.gov"
 
-ROOT_DIR = Path(__file__).resolve().parent
-LOG_DIR = ROOT_DIR / "logs"
-METADATA_DIR = ROOT_DIR / "downloads" / "published_opinions"
-PDF_DOWNLOAD_BASE = METADATA_DIR / "download"  # ✅ HTML/PNG will also go here
+ROOT = Path(__file__).resolve().parent
+LOG_DIR = ROOT / "logs"
+DOWNLOAD_ROOT = ROOT / "downloads" / "published_opinions" / "download"
+META_DIR = ROOT / "downloads" / "published_opinions"
 
-DEFAULT_LOG_PATH = LOG_DIR / f"published-opinions-{datetime.date.today():%Y%m%d}.log"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+META_DIR.mkdir(parents=True, exist_ok=True)
 
-METADATA_FIELDS = [
+LOG_FILE = LOG_DIR / f"published-opinions-{datetime.date.today():%Y%m%d}.log"
+CSV_FILE = META_DIR / f"{datetime.date.today():%Y%m%d}-metadata.csv"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(asctime)s %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
+)
+log = logging.getLogger("scraper")
+
+
+CSV_FIELDS = [
     "case_number",
     "date",
     "court",
@@ -53,172 +49,122 @@ METADATA_FIELDS = [
     "pdf_url",
     "pdf_filename",
     "download_status",
-    "case_html_filename",
-    "case_png_filename",
-    "case_page_status",
+    "tabs_status",
 ]
 
-logger = logging.getLogger("published_opinions")
 
-
-# -----------------------
-# Utilities
-# -----------------------
-
-def configure_logging(level: str, log_path: Path) -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S")
-
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-    logger.handlers.clear()
-
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    logger.info("Logging to %s", log_path)
-
+# -----------------------------
+# Helpers
+# -----------------------------
 
 def create_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=0.6,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-    )
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.6, status_forcelist=(500, 502, 503, 504))
     adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update(
         {
-            "User-Agent": "LegalAI-Scraper/PublishedOpinions",
+            "User-Agent": "Mozilla/5.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
     )
-    return session
-
-
-def sanitize_filename(value: str) -> str:
-    cleaned = re.sub(r"[^\w\s-]", "", value or "")
-    cleaned = re.sub(r"\s+", "_", cleaned).strip("_")
-    return cleaned[:220] if cleaned else "file"
-
-
-def metadata_csv_path() -> Path:
-    METADATA_DIR.mkdir(parents=True, exist_ok=True)
-    return METADATA_DIR / f"{datetime.date.today():%Y%m%d}-metadata.csv"
-
-
-def load_existing_case_numbers(path: Path) -> set[str]:
-    if not path.exists():
-        return set()
-    seen: set[str] = set()
-    with path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            cn = (row.get("case_number") or "").strip()
-            if cn:
-                seen.add(cn)
-    return seen
+    return s
 
 
 def case_folder(case_number: str) -> Path:
-    # ✅ This is the SAME folder where PDF is stored
-    d = PDF_DOWNLOAD_BASE / sanitize_filename(case_number)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    p = DOWNLOAD_ROOT / case_number
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def fetch_listing_page(session: requests.Session, page: int) -> str:
+    # Site uses page=0 for first page.
     url = f"{SEARCH_BASE_URL}?{urlencode({'page': str(page)})}"
-    logger.info("Fetching listing page %d: %s", page, url)
     r = session.get(url, timeout=30)
     r.raise_for_status()
     return r.text
 
 
-def parse_pagination(html: str) -> tuple[int, int, int]:
-    m = re.search(r"(\d+)\s*-\s*(\d+)\s*of\s*([0-9,]+)\s*results", html, re.IGNORECASE)
+def parse_total_results(listing_html: str) -> int:
+    """
+    Parses "1 - 50 of 305 results"
+    """
+    m = re.search(r"of\s*([0-9,]+)\s*results", listing_html, re.IGNORECASE)
     if not m:
-        return 0, 0, 0
-    start = int(m.group(1))
-    end = int(m.group(2))
-    total = int(m.group(3).replace(",", ""))
-    return start, end, total
+        return 0
+    return int(m.group(1).replace(",", ""))
 
 
-def extract_case_number_from_url(url: str) -> str:
-    parsed = urlparse(url)
-    params = dict(parse_qsl(parsed.query))
-    return params.get("query_caseNumber") or params.get("caseNumber") or ""
+def extract_case_number_from_case_url(case_url: str) -> str:
+    """
+    case_url example:
+      ...mainCaseScreen.cfm?dist=6&doc_id=...&doc_no=H052913&request_token=...
+    We'll use doc_no if case_number text is missing on listing.
+    """
+    qs = parse_qs(urlparse(case_url).query)
+    # doc_no is very stable and matches what you want as case folder name
+    doc_no = (qs.get("doc_no") or [""])[0].strip()
+    if doc_no:
+        return doc_no
+    # fallback to other keys if present
+    case_num = (qs.get("caseNumber") or qs.get("query_caseNumber") or [""])[0].strip()
+    return case_num
 
 
-def parse_entries(html: str) -> list[dict[str, str]]:
-    soup = BeautifulSoup(html, "lxml")
-    entries: list[dict[str, str]] = []
+def _find_pdf_url_in_card(card) -> str:
+    """
+    Robust PDF detection for the listing card.
+    """
+    for a in card.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        hl = href.lower()
+        if "/opinions/documents/" in hl and ".pdf" in hl:
+            return urljoin("https://www.courts.ca.gov", href)
+        if hl.endswith(".pdf"):
+            return urljoin("https://www.courts.ca.gov", href)
+    return ""
+
+
+def parse_entries(listing_html: str) -> list[dict[str, str]]:
+    soup = BeautifulSoup(listing_html, "lxml")
+    rows = []
 
     for card in soup.select("div.result-excerpt"):
-        title_anchor = card.select_one("div.result-excerpt__title h2 a")
-        if not title_anchor or not title_anchor.get("href"):
+        a = card.select_one("div.result-excerpt__title h2 a")
+        if not a or not a.get("href"):
             continue
 
-        title = title_anchor.get_text(strip=True)
-        case_info_url = urljoin(CASE_BASE_URL, title_anchor["href"])
+        title = a.get_text(strip=True)
+        case_url = urljoin(CASE_BASE_URL, a.get("href"))
 
-        case_number_element = card.select_one(".result-excerpt__brow-primary")
-        date_element = card.select_one(".result-excerpt__brow-secondary")
-        notation_element = card.select_one(".result-excerpt__brow-notation")
+        # Case number shown on listing (ex: H052913M / B347381M)
+        num_el = card.select_one(".result-excerpt__brow-primary")
+        case_number = num_el.get_text(strip=True) if num_el else ""
 
-        case_number = case_number_element.get_text(strip=True) if case_number_element else ""
+        # If listing is missing it, pull from URL doc_no
         if not case_number:
-            case_number = extract_case_number_from_url(case_info_url)
+            case_number = extract_case_number_from_case_url(case_url)
+
         if not case_number:
+            # Never skip silently; log it
+            log.warning("Skipping entry with no case number: %s (%s)", title, case_url)
             continue
 
-        case_date = date_element.get_text(strip=True) if date_element else ""
-        court = ""
-        opinion_type = "Published Opinion"
+        pdf_url = _find_pdf_url_in_card(card)
 
-        if notation_element:
-            notation = notation_element.get_text(" ", strip=True)
-            if "•" in notation:
-                parts = [p.strip() for p in notation.split("•", 1)]
-                court = parts[0]
-                if len(parts) > 1:
-                    opinion_type = parts[1]
-            else:
-                court = notation
-
-        pdf_url = ""
-        pdf_anchor = card.select_one("a.button.file")
-        if pdf_anchor and pdf_anchor.get("href"):
-            pdf_url = urljoin("https://www.courts.ca.gov", pdf_anchor["href"])
-        else:
-            for a in card.select("a[href]"):
-                href = (a.get("href") or "").strip()
-                txt = (a.get_text(" ", strip=True) or "").lower()
-                if ".pdf" in href.lower() or txt.startswith("pdf"):
-                    pdf_url = urljoin("https://www.courts.ca.gov", href)
-                    break
-
-        entries.append(
+        rows.append(
             {
                 "case_number": case_number,
-                "date": case_date,
-                "court": court,
-                "opinion_type": opinion_type,
                 "title": title,
-                "case_info_url": case_info_url,  # ✅ from the <a> href
+                "case_info_url": case_url,
                 "pdf_url": pdf_url,
             }
         )
 
-    return entries
+    return rows
 
 
 def download_pdf(session: requests.Session, pdf_url: str, case_number: str) -> tuple[str, str]:
@@ -226,256 +172,252 @@ def download_pdf(session: requests.Session, pdf_url: str, case_number: str) -> t
         return "", "missing_pdf"
 
     folder = case_folder(case_number)
-    parsed = urlparse(pdf_url)
-    filename = Path(parsed.path).name or f"{sanitize_filename(case_number)}.pdf"
+    filename = Path(urlparse(pdf_url).path).name or f"{case_number}.PDF"
     path = folder / filename
 
     if path.exists():
         return filename, "cached"
 
-    logger.info("Downloading PDF for %s: %s", case_number, pdf_url)
+    log.info("Downloading PDF for %s: %s", case_number, pdf_url)
+
     try:
         r = session.get(pdf_url, stream=True, timeout=60)
         r.raise_for_status()
-        with path.open("wb") as f:
-            for chunk in r.iter_content(chunk_size=32768):
-                if chunk:
-                    f.write(chunk)
+        with open(path, "wb") as f:
+            for c in r.iter_content(32768):
+                if c:
+                    f.write(c)
         return filename, "downloaded"
     except Exception as e:
-        logger.warning("PDF download failed for %s: %s", case_number, e)
+        log.warning("PDF download failed %s : %s", case_number, e)
         return "", "download_error"
 
 
-def _looks_blocked(html: str) -> bool:
+def looks_blocked(html: str) -> bool:
     h = (html or "").lower()
-    return ("request rejected" in h) or ("support id" in h and "rejected" in h)
+    return "request rejected" in h or ("support id" in h and "rejected" in h)
 
 
-# -----------------------
-# ✅ Core: open the title <a> link and save THAT page only
-# -----------------------
-
-def save_case_html_png(case_info_url: str, case_number: str, title: str, headless: bool) -> tuple[str, str, str]:
+def _save_current_page(case_page, out_dir: Path, suffix: str) -> str:
     """
-    ✅ Saves HTML+PNG for the CASE PAGE (appellatecases...), NOT the listing.
-
-    Strategy:
-    - Open listing page in Playwright
-    - Locate the result card by case_number
-    - Grab the title <a> and click it
-      - If it opens a new tab -> use popup page
-      - Else -> use same page after navigation
-    - Save HTML first, then screenshot with fallbacks
-    - Save into SAME folder as PDF: downloads/published_opinions/download/<case_number>/
+    Save current page as suffix.html and suffix.png
     """
-    folder = case_folder(case_number)
-    base = sanitize_filename(title) or sanitize_filename(case_number)
+    html_path = out_dir / f"{suffix}.html"
+    png_path = out_dir / f"{suffix}.png"
 
-    html_filename = f"{base}.html"
-    png_filename = f"{base}.png"
-    html_path = folder / html_filename
-    png_path = folder / png_filename
+    html = case_page.content()
+    html_path.write_text(html, encoding="utf-8")
 
-    if html_path.exists() and png_path.exists():
-        return html_filename, png_filename, "cached"
+    if looks_blocked(html):
+        return "blocked_html_saved"
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-            ],
-        )
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-            ),
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-
-        page = context.new_page()
-        page.goto(SEARCH_BASE_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(800)
-
-        # Find the exact card by case number, then the title link inside it
-        locator = page.get_by_text(case_number, exact=False)
-        if locator.count() == 0:
-            browser.close()
-            return "", "", "not_found_on_listing"
-
-        card = locator.first.locator("xpath=ancestor::div[contains(@class,'result-excerpt')]")
-        link = card.locator("css=div.result-excerpt__title h2 a").first
-        if link.count() == 0:
-            browser.close()
-            return "", "", "title_link_not_found"
-
-        # Confirm href matches what we parsed (optional safety)
-        href = link.get_attribute("href") or ""
-        opened_url = urljoin(CASE_BASE_URL, href) if href else case_info_url
-
-        # Click and capture popup if it opens a new tab
-        case_page = None
+    try:
+        case_page.screenshot(path=str(png_path), full_page=True)
+        return "saved"
+    except Exception:
         try:
-            with page.expect_popup(timeout=5000) as pop:
-                link.click()
-            case_page = pop.value
-        except Exception:
-            # No popup -> navigation in same tab
+            case_page.screenshot(path=str(png_path), full_page=False)
+            return "saved_viewport_only"
+        except Exception as e:
+            return f"html_saved_png_failed:{type(e).__name__}"
+
+
+def save_all_tabs_for_case(context, case_number: str, case_info_url: str, out_dir: Path) -> dict:
+    """
+    Open listing page -> click title link -> case page
+    Save:
+      case_summary + tabs: docket, briefs, scheduled actions, disposition, parties, trial court
+    """
+    tabs = [
+        ("docket", "Docket"),
+        ("briefs", "Briefs"),
+        ("scheduled_actions", "Scheduled Actions"),
+        ("disposition", "Disposition"),
+        ("parties_and_attorneys", "Parties and Attorneys"),
+        ("trial_court", "Trial Court"),
+    ]
+
+    result = {}
+
+    page = context.new_page()
+    page.goto(SEARCH_BASE_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(600)
+
+    locator = page.get_by_text(case_number, exact=False)
+    if locator.count() == 0:
+        page.close()
+        return {"error": "case_not_found_on_listing"}
+
+    card = locator.first.locator("xpath=ancestor::div[contains(@class,'result-excerpt')]")
+    link = card.locator("css=div.result-excerpt__title h2 a").first
+
+    try:
+        with page.expect_popup(timeout=5000) as pop:
             link.click()
-            case_page = page
+        case_page = pop.value
+    except Exception:
+        link.click()
+        case_page = page
 
-        # Wait for case page load
+    try:
+        case_page.wait_for_load_state("domcontentloaded", timeout=60000)
+        case_page.wait_for_load_state("networkidle", timeout=60000)
+    except PlaywrightTimeoutError:
+        pass
+
+    # Ensure we are really on appellatecases site
+    if "appellatecases.courtinfo.ca.gov" not in case_page.url:
+        case_page.goto(case_info_url, wait_until="domcontentloaded", timeout=60000)
         try:
-            case_page.wait_for_load_state("domcontentloaded", timeout=60000)
             case_page.wait_for_load_state("networkidle", timeout=60000)
         except PlaywrightTimeoutError:
             pass
 
-        # ✅ IMPORTANT: ensure we are on case_info_url domain
-        final_url = case_page.url
-        if "appellatecases.courtinfo.ca.gov" not in final_url:
-            # Sometimes it doesn't navigate; force open the case url in the SAME context (keeps cookies)
-            case_page.goto(opened_url, wait_until="domcontentloaded", timeout=60000)
+    # Save Case Summary first (default page)
+    result["case_summary"] = _save_current_page(case_page, out_dir, "case_summary")
+
+    # Save each tab
+    for suffix, label in tabs:
+        try:
+            case_page.get_by_text(label, exact=True).click(timeout=8000)
+            case_page.wait_for_timeout(350)
             try:
-                case_page.wait_for_load_state("networkidle", timeout=60000)
+                case_page.wait_for_load_state("networkidle", timeout=8000)
             except PlaywrightTimeoutError:
                 pass
-
-        # ✅ Save HTML FIRST (even if screenshot fails)
-        html = case_page.content()
-        html_path.write_text(html, encoding="utf-8")
-
-        if _looks_blocked(html):
-            browser.close()
-            # HTML saved, but it is blocked page
-            return html_filename, "", "blocked_html_saved"
-
-        # Screenshot with fallback
-        try:
-            case_page.screenshot(path=str(png_path), full_page=True)
-            browser.close()
-            return html_filename, png_filename, "saved"
+            result[suffix] = _save_current_page(case_page, out_dir, suffix)
         except Exception:
-            try:
-                case_page.screenshot(path=str(png_path), full_page=False)
-                browser.close()
-                return html_filename, png_filename, "saved_viewport_only"
-            except Exception as e:
-                browser.close()
-                return html_filename, "", f"html_saved_png_failed:{type(e).__name__}"
+            result[suffix] = "tab_click_failed"
+
+    return result
 
 
-# -----------------------
+def load_seen_cases(csv_path: Path) -> set[str]:
+    if not csv_path.exists():
+        return set()
+    seen = set()
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            cn = (row.get("case_number") or "").strip()
+            if cn:
+                seen.add(cn)
+    return seen
+
+
+# -----------------------------
 # Main
-# -----------------------
+# -----------------------------
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--start-page", type=int, default=0)
-    parser.add_argument("--max-pages", type=int, default=0, help="0 = no limit")
-    parser.add_argument("--delay", type=float, default=1.5, help="Delay between cases (seconds)")
-    parser.add_argument("--headless", action="store_true", help="Headless mode (may block more often)")
+    parser.add_argument("--delay", type=float, default=1.5, help="Delay between cases")
+    parser.add_argument("--headless", action="store_true", default=True,
+                        help="Run browser in background (default True). Use --no-headless to show.")
+    parser.add_argument("--no-headless", dest="headless", action="store_false",
+                        help="Show browser window (debug)")
+    parser.add_argument("--max-pages", type=int, default=0,
+                        help="0 = scrape ALL pages until total results reached")
     args = parser.parse_args()
 
-    configure_logging(args.log_level, DEFAULT_LOG_PATH)
-    PDF_DOWNLOAD_BASE.mkdir(parents=True, exist_ok=True)
-
     session = create_session()
-    csv_path = metadata_csv_path()
-    seen = load_existing_case_numbers(csv_path)
-    file_exists = csv_path.exists()
+    seen = load_seen_cases(CSV_FILE)
+    first_write = not CSV_FILE.exists()
 
-    processed = 0
-    current_page = args.start_page
-    total_results = None
-    per_page = 50
+    # We will keep one browser session for all cases (more stable & faster)
+    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if first_write:
+            writer.writeheader()
 
-    try:
-        with csv_path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=METADATA_FIELDS)
-            if not file_exists:
-                writer.writeheader()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=args.headless,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+
+            page_no = 0
+            total_results = None
+            total_written_this_run = 0
 
             while True:
-                listing_html = fetch_listing_page(session, current_page)
-                start, end, total = parse_pagination(listing_html)
-                if total_results is None and total:
-                    total_results = total
-                if end and start:
-                    per_page = max(per_page, (end - start + 1))
+                listing_html = fetch_listing_page(session, page_no)
+
+                if total_results is None:
+                    total_results = parse_total_results(listing_html)
+                    log.info("Total results reported by site: %s", total_results)
 
                 entries = parse_entries(listing_html)
-                logger.info("Page %d: %d entries", current_page, len(entries))
+                log.info("Listing page %d -> parsed %d cases", page_no, len(entries))
 
-                for entry in entries:
-                    case_number = entry["case_number"]
-                    if not case_number or case_number in seen:
+                if not entries:
+                    log.info("No entries found on page %d, stopping.", page_no)
+                    break
+
+                for e in entries:
+                    case_number = e["case_number"]
+
+                    # IMPORTANT: If you rerun same day, it will skip already-saved cases
+                    if case_number in seen:
                         continue
 
-                    title = entry.get("title", "")
-                    pdf_url = entry.get("pdf_url", "")
-                    case_info_url = entry.get("case_info_url", "")
+                    folder = case_folder(case_number)
 
-                    # 1) PDF
-                    pdf_filename, download_status = download_pdf(session, pdf_url, case_number)
+                    pdf_file, pdf_status = download_pdf(session, e.get("pdf_url", ""), case_number)
 
-                    # 2) ✅ CASE PAGE HTML + PNG (NOT listing)
-                    html_name, png_name, page_status = ("", "", "skipped")
-                    if case_info_url:
-                        html_name, png_name, page_status = save_case_html_png(
-                            case_info_url=case_info_url,
+                    tabs_status = {}
+                    try:
+                        tabs_status = save_all_tabs_for_case(
+                            context=context,
                             case_number=case_number,
-                            title=title,
-                            headless=args.headless,
+                            case_info_url=e["case_info_url"],
+                            out_dir=folder,
                         )
+                    except Exception as ex:
+                        log.warning("Tabs failed for %s : %s", case_number, ex)
+                        tabs_status = {"error": str(ex)}
 
-                    row = {
-                        "case_number": case_number,
-                        "date": entry.get("date", ""),
-                        "court": entry.get("court", ""),
-                        "opinion_type": entry.get("opinion_type", ""),
-                        "title": title,
-                        "case_info_url": case_info_url,
-                        "pdf_url": pdf_url,
-                        "pdf_filename": pdf_filename,
-                        "download_status": download_status,
-                        "case_html_filename": html_name,
-                        "case_png_filename": png_name,
-                        "case_page_status": page_status,
-                    }
-
-                    writer.writerow(row)
+                    writer.writerow(
+                        {
+                            "case_number": case_number,
+                            "title": e.get("title", ""),
+                            "case_info_url": e.get("case_info_url", ""),
+                            "pdf_url": e.get("pdf_url", ""),
+                            "pdf_filename": pdf_file,
+                            "download_status": pdf_status,
+                            "tabs_status": str(tabs_status),
+                        }
+                    )
                     f.flush()
                     seen.add(case_number)
-                    processed += 1
+                    total_written_this_run += 1
 
                     time.sleep(max(0.0, args.delay))
 
-                # stop
-                if total_results is not None and (current_page + 1) * per_page >= total_results:
-                    break
-                current_page += 1
-                if args.max_pages and (current_page - args.start_page) >= args.max_pages:
+                page_no += 1
+
+                # Stop if user limited pages
+                if args.max_pages and page_no >= args.max_pages:
+                    log.info("Reached max-pages=%d, stopping.", args.max_pages)
                     break
 
-    except Exception as e:
-        logger.exception("Fatal error: %s", e)
-        return 1
+                # If site total known and we likely reached end, stop
+                # Each page shows 50 results normally
+                if total_results and page_no * 50 >= total_results:
+                    log.info("Reached end based on total_results (%d).", total_results)
+                    break
 
-    logger.info("Done. New cases processed: %d", processed)
-    logger.info("PDF + HTML + PNG folders are under: %s", PDF_DOWNLOAD_BASE.resolve())
-    logger.info("CSV: %s", csv_path.resolve())
-    return 0
+            browser.close()
+
+    log.info("DONE. New records written this run: %d", total_written_this_run)
+    log.info("CSV file: %s", CSV_FILE)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
