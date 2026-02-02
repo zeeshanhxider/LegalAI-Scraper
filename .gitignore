@@ -7,7 +7,8 @@ env/
 downloads/
 test_downloads/
 test_run/
-
+pennsylvania/downloads
+pennsylvania/debug
 # Checkpoints and logs
 scraper_checkpoint.json
 *.log
