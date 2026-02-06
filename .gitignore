@@ -4,7 +4,6 @@ env/
 .venv/
 
 # Downloads and output
-downloads/
 test_downloads/
 test_run/
 pennsylvania/downloads
@@ -33,4 +32,4 @@ Thumbs.db
 # metadata.csv
 /bin
 /lib
-/colorado/download
+
