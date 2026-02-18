@@ -4,10 +4,10 @@ env/
 .venv/
 
 # Downloads and output
-downloads/
 test_downloads/
 test_run/
-
+pennsylvania/downloads
+pennsylvania/debug
 # Checkpoints and logs
 scraper_checkpoint.json
 *.log
@@ -30,3 +30,6 @@ Thumbs.db
 
 # Metadata (optional - uncomment if you want to track it)
 # metadata.csv
+/bin
+/lib
+
