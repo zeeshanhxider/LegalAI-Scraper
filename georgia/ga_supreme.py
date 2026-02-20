@@ -154,6 +154,8 @@ def scrape_year_page_streaming(year: int, url: str, writer, csv_file_handle):
 
     # Deduplicate downloads per year page by URL (same pdf may map to multiple case_ids)
     pdf_urls_seen = set()
+    # Skip duplicate date blocks within the same year page
+    dates_seen = set()
     rows_written = 0
 
     for h3 in months:
@@ -162,6 +164,7 @@ def scrape_year_page_streaming(year: int, url: str, writer, csv_file_handle):
             continue
 
         current_date = None
+        skip_current_date = False
         node = h3.next_sibling
 
         while node:
@@ -175,23 +178,29 @@ def scrape_year_page_streaming(year: int, url: str, writer, csv_file_handle):
                     date_text = strong.get_text(" ", strip=True)
                     if date_text:
                         current_date = clean_date_text(date_text)
+                        if current_date in dates_seen:
+                            skip_current_date = True
+                        else:
+                            skip_current_date = False
 
             # Case list
             if getattr(node, "name", None) == "ul":
-                if not current_date:
+                if not current_date or skip_current_date:
                     node = node.next_sibling
                     continue
 
+                wrote_for_date = False
                 for li in node.find_all("li", recursive=False):
                     a = li.find("a", href=True)
                     if not a:
                         continue
 
                     text = a.get_text(" ", strip=True)
-                    pdf_url = (a["href"] or "").strip()
+                    pdf_href = (a["href"] or "").strip()
+                    pdf_url = urljoin(url, pdf_href)
 
-                    # Case PDFs are .pdf
-                    if not pdf_url.lower().endswith(".pdf"):
+                    # Case PDFs are .pdf (ignore query strings)
+                    if not urlparse(pdf_url).path.lower().endswith(".pdf"):
                         continue
 
                     case_ids, case_title = parse_case_text(text)
@@ -228,8 +237,12 @@ def scrape_year_page_streaming(year: int, url: str, writer, csv_file_handle):
                         writer.writerow(row)
                         csv_file_handle.flush()  # ✅ write immediately
                         rows_written += 1
+                        wrote_for_date = True
 
                         print(f"✅ {year} | {month} | {current_date} | {cid} | {dl_status}")
+
+                if wrote_for_date:
+                    dates_seen.add(current_date)
 
             node = node.next_sibling
 

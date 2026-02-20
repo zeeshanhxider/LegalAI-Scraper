@@ -23,6 +23,7 @@ Outputs:
 """
 
 import csv
+import hashlib
 import os
 import re
 import sys
@@ -45,6 +46,7 @@ PAGE_DELAY_SEC = 0.35
 
 MAX_PAGES = None   # set to 2 for testing
 MAX_ITEMS = None   # set to 50 for testing
+MAX_FILENAME_LEN = 150  # keep paths shorter for Windows MAX_PATH compatibility
 
 
 def ensure_dirs():
@@ -56,12 +58,24 @@ def clean_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def safe_filename(name: str, default="file") -> str:
+def safe_filename(name: str, default="file", max_len: int = MAX_FILENAME_LEN) -> str:
     name = clean_ws(name)
     name = re.sub(r"[^\w\-. ()\[\]/]+", "_", name)
     name = name.replace("/", "_")
     name = name.strip("._ ")
-    return name if name else default
+    if not name:
+        return default
+
+    if len(name) <= max_len:
+        return name
+
+    base, ext = os.path.splitext(name)
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+    suffix = f"_{digest}{ext}" if ext else f"_{digest}"
+    keep = max_len - len(suffix)
+    if keep <= 0:
+        return (digest + ext)[:max_len]
+    return f"{base[:keep]}{suffix}"
 
 
 def get_html(session: requests.Session, url: str, timeout=60) -> str:
@@ -134,7 +148,7 @@ def parse_cards(soup: BeautifulSoup, page_url: str):
         pdf_file = ""
         if pdf_url:
             base = os.path.basename(urlparse(pdf_url).path) or "opinion.pdf"
-            pdf_file = safe_filename(f"{no}_{base}" if no else base, default="opinion.pdf")
+            pdf_file = safe_filename(f"{no}_{base}" if no else base, default="opinion.pdf", max_len=MAX_FILENAME_LEN)
             if not pdf_file.lower().endswith(".pdf"):
                 pdf_file += ".pdf"
 

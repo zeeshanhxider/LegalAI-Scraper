@@ -17,6 +17,7 @@ Notes:
 """
 
 import csv
+import hashlib
 import os
 import re
 import sys
@@ -39,6 +40,7 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML,
 PAGE_DELAY_SEC = 0.5
 MAX_PAGES = None   # set e.g. 5 for test
 MAX_ITEMS = None   # set e.g. 50 for test
+MAX_FILENAME_LEN = 150  # keep paths shorter for Windows MAX_PATH compatibility
 
 
 @dataclass
@@ -66,11 +68,23 @@ def clean_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def safe_filename(name: str, default: str = "file") -> str:
+def safe_filename(name: str, default: str = "file", max_len: int = MAX_FILENAME_LEN) -> str:
     name = clean_ws(name)
     name = re.sub(r"[^\w\-. ()\[\]]+", "_", name)
     name = name.strip("._ ")
-    return name if name else default
+    if not name:
+        return default
+
+    if len(name) <= max_len:
+        return name
+
+    base, ext = os.path.splitext(name)
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+    suffix = f"_{digest}{ext}" if ext else f"_{digest}"
+    keep = max_len - len(suffix)
+    if keep <= 0:
+        return (digest + ext)[:max_len]
+    return f"{base[:keep]}{suffix}"
 
 
 def pick_filename_from_url(url: str) -> str:
@@ -273,7 +287,7 @@ def main():
                 else:
                     out_name = f"{base_name}_{orig_name}"
 
-                out_name = safe_filename(out_name, default="opinion.pdf")
+                out_name = safe_filename(out_name, default="opinion.pdf", max_len=MAX_FILENAME_LEN)
                 if not out_name.lower().endswith(".pdf"):
                     out_name += ".pdf"
 

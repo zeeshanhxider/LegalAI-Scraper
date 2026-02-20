@@ -46,6 +46,60 @@ def safe_filename(name: str, max_len: int = 150) -> str:
     return name[:max_len] if len(name) > max_len else name
 
 
+def is_bare_pdf_filename(text: str) -> bool:
+    if not text:
+        return False
+    s = text.strip()
+    if s.lower().startswith(("http://", "https://", "//")):
+        return False
+    if "/" in s or "\\" in s:
+        return False
+    return bool(re.search(r"(?i)\.pdf(\?.*)?$", s))
+
+
+def sanitize_pdf_url(url: str) -> str:
+    if not url:
+        return url
+    try:
+        parts = urlparse(url)
+    except Exception:
+        return url
+    path = parts.path or ""
+    # Strip trailing ".pdf.tempXXXX" patterns observed in PACourts links.
+    new_path = re.sub(r"(?i)\.pdf\.temp[0-9a-z_-]*$", ".pdf", path)
+    if new_path != path:
+        return parts._replace(path=new_path).geturl()
+    return url
+
+
+def is_suspicious_root_pdf(url: str) -> bool:
+    try:
+        parts = urlparse(url)
+    except Exception:
+        return False
+    if not parts.netloc.endswith("pacourts.us"):
+        return False
+    path = parts.path or ""
+    return path.lower().endswith(".pdf") and path.count("/") == 1
+
+
+def normalize_candidate_url(candidate: str, base_url: str) -> str:
+    if not candidate:
+        return ""
+    cand = candidate.strip()
+    if cand.lower().startswith(("javascript:", "mailto:")):
+        return ""
+    if is_bare_pdf_filename(cand):
+        return ""
+    url = normalize_url(cand, base_url)
+    if not url:
+        return ""
+    url = sanitize_pdf_url(url)
+    if is_suspicious_root_pdf(url):
+        return ""
+    return url if looks_like_pdf_url(url) else ""
+
+
 async def locator_text_first(locator, default=""):
     """
     Fix strict mode violation by always reading the FIRST matched element.
@@ -133,6 +187,7 @@ async def finalize_downloads(tasks: list) -> None:
 
 
 def build_pdf_filename(title: str, pdf_url: str) -> str:
+    pdf_url = sanitize_pdf_url(pdf_url)
     base = safe_filename(title) or "document"
     url_name = os.path.basename(urlparse(pdf_url).path)
     if url_name.lower().endswith(".pdf") and len(url_name) > 4:
@@ -238,7 +293,12 @@ async def click_and_capture_pdf(page, title_locator) -> str:
             with suppress(Exception):
                 await new_page.close()
 
-    return pdf_url or ""
+    if pdf_url:
+        pdf_url = sanitize_pdf_url(pdf_url)
+        if is_suspicious_root_pdf(pdf_url):
+            return ""
+        return pdf_url
+    return ""
 
 
 def find_pdf_url_in_text(text: str) -> str:
@@ -247,7 +307,8 @@ def find_pdf_url_in_text(text: str) -> str:
     text = html.unescape(text)
     match = re.search(r"https?://[^\s\"'<>]+\.pdf[^\s\"'<>]*", text, re.IGNORECASE)
     if match:
-        return match.group(0)
+        url = sanitize_pdf_url(match.group(0))
+        return "" if is_suspicious_root_pdf(url) else url
     return ""
 
 
@@ -286,8 +347,8 @@ async def extract_url_from_element(el, base_url: str) -> str:
             candidates.append(v)
 
     for cand in candidates:
-        url = normalize_url(cand, base_url)
-        if url and looks_like_pdf_url(url):
+        url = normalize_candidate_url(cand, base_url)
+        if url:
             return url
         url = find_pdf_url_in_text(cand)
         if url:
@@ -298,7 +359,8 @@ async def extract_url_from_element(el, base_url: str) -> str:
 
 async def extract_pdf_url_from_page(page) -> str:
     if is_pdf_url(page.url):
-        return page.url
+        url = sanitize_pdf_url(page.url)
+        return "" if is_suspicious_root_pdf(url) else url
 
     selectors = [
         ("embed[type='application/pdf']", "src"),
@@ -311,8 +373,8 @@ async def extract_pdf_url_from_page(page) -> str:
         loc = page.locator(sel)
         if await loc.count():
             raw = await loc.first.get_attribute(attr)
-            url = normalize_url(raw, page.url)
-            if url and looks_like_pdf_url(url):
+            url = normalize_candidate_url(raw, page.url)
+            if url:
                 return url
 
     try:
@@ -369,12 +431,12 @@ async def extract_pdf_url_from_result(result, base_url: str) -> str:
             if not isinstance(payload, dict):
                 continue
             for key in ("clickUri", "uri", "rawUri", "printableUri"):
-                url = normalize_url(payload.get(key, ""), base_url)
-                if url:
-                    return url
+            url = normalize_candidate_url(payload.get(key, ""), base_url)
+            if url:
+                return url
             raw = payload.get("raw", {}) or {}
             for key in ("uri", "clickuri", "fileuri", "fileurl"):
-                url = normalize_url(raw.get(key, ""), base_url)
+                url = normalize_candidate_url(raw.get(key, ""), base_url)
                 if url:
                     return url
 

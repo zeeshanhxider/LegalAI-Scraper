@@ -129,7 +129,7 @@ def derive_year_month(file_date: str, fallback: datetime.datetime) -> tuple[str,
 
 
 def pdf_output_dir(year: str, month: str) -> Path:
-    root = Path(__file__).resolve().parent / "downloads" / "supreme_court_opinions"
+    root = Path(__file__).resolve().parent / "downloads" / "court_opinions"
     target = root / year / month
     target.mkdir(parents=True, exist_ok=True)
     return target
@@ -206,7 +206,7 @@ def build_metadata_row(row: dict[str, str], scraped_at: datetime.datetime) -> di
 
 
 def metadata_csv_path() -> Path:
-    root = Path(__file__).resolve().parent / "downloads" / "supreme_court_opinions"
+    root = Path(__file__).resolve().parent / "downloads" / "court_opinions"
     root.mkdir(parents=True, exist_ok=True)
     return root / f"{datetime.date.today():%Y%m%d}-metadata.csv"
 

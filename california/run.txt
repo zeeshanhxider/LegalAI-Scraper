@@ -1,0 +1,38 @@
+Supreme only, resume, single worker:
+python california/case_number_search_scraper.py \
+  --csv-dir california/downloads/court_opinions/case_numbers/Supreme \
+  --skip-complete
+
+All courts, resume, 4 workers:
+python case_number_search_scraper.py --csv-dir california/downloads/court_opinions/case_numbers --skip-complete  --workers 5
+Single CSV:
+python california/case_number_search_scraper.py \
+  --csv california/downloads/court_opinions/case_numbers/Supreme/0_AB.csv
+
+python party_search_case_numbers.py --prefixes GJ --dist 1 --headed
+
+
+With extra log file + debug:
+python california/case_number_search_scraper.py \
+  --csv-dir california/downloads/court_opinions/case_numbers/Supreme \
+  --skip-complete \
+  --workers 2 \
+  --extra-log-file california/logs/case-number-search-extra.log \
+  --debug
+
+Party search (resume from MC, skip existing, debug to file):
+python party_search_case_numbers.py --skip-existing   --debug-file   --workers 5 
+
+Party search (Supreme only, 4 workers):
+python california/party_search_case_numbers.py \
+  --prefixes AA,AB,AC,AD \
+  --workers 4
+
+Party search (debug HTML dump for empty results):
+python california/party_search_case_numbers.py \
+  --prefixes LR,LS,LT \
+  --debug \
+  --dump-html-dir california/downloads/court_opinions/case_numbers/debug_html
+
+
+  
