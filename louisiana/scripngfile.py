@@ -26,6 +26,8 @@ OUT_CSV_FILENAME = "lasc_cases.csv"
 HEADLESS = True
 PAGE_SIZE = 20
 START_PAGE = 1
+MAX_PAGE = 1000
+EMPTY_RESULT_PASS_PAGES = {278}
 CSV_COLUMNS = [
     "listing_title",
     "listing_url",
@@ -578,7 +580,7 @@ def run() -> None:
             writer = csv.DictWriter(f, fieldnames=headers)
             page = START_PAGE
 
-            while True:
+            while page <= MAX_PAGE:
                 page_url = BASE_URL_TEMPLATE.format(page=page, page_size=PAGE_SIZE)
                 logger.info("Navigating to listing page %s: %s", page, page_url)
                 ok = load_page_with_retries(
@@ -594,6 +596,17 @@ def run() -> None:
 
                 records = extract_listing_records(driver, page_url)
                 if not records:
+                    if page in EMPTY_RESULT_PASS_PAGES:
+                        next_page = page + 1
+                        logger.warning(
+                            "No article.post records on page %s, but configured to continue to page %s.",
+                            page,
+                            next_page,
+                        )
+                        page = next_page
+                        time.sleep(random.uniform(*POLITE_DELAY_RANGE))
+                        continue
+
                     logger.info("No article.post records on page %s. Stopping pagination.", page)
                     break
 
@@ -698,6 +711,9 @@ def run() -> None:
                 logger.info("Moving pagination from page %s to page %s", page, next_page)
                 page = next_page
                 time.sleep(random.uniform(*POLITE_DELAY_RANGE))
+
+            if page > MAX_PAGE:
+                logger.info("Reached MAX_PAGE=%s; stopping pagination.", MAX_PAGE)
 
     finally:
         if driver is not None:
