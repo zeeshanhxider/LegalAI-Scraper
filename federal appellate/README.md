@@ -38,7 +38,48 @@ export COURTLISTENER_TOKEN="your-api-token-here"
 
 Or pass it directly with `--api-token` flag.
 
-### 2. Test with a single court
+### 2. Production Run: Multiprocess Orchestrator (Recommended)
+
+The multiprocess orchestrator (`run_all_years.py`) distributes scraping across 13 parallel year-processes with async workers, achieving ~4-5x speedup:
+
+```bash
+# Full production run: all years (2013-2025), all courts, all cases
+python run_all_years.py --all
+
+# Test run: 1 case per court per year (fast verification, ~5 min)
+python run_all_years.py --limit 1
+
+# Specific years and limit
+python run_all_years.py --limit 100 --years 2020 2021 2022
+
+# Specific courts only
+python run_all_years.py --limit 50 --courts ca1 ca9 cadc
+
+# Conservative rate budget (half quota, ~2400 req/hr)
+python run_all_years.py --all --rate-budget 2400
+```
+
+**Note**: Either `--all` or `--limit N` is required (mutually exclusive). Omitting both is an error to prevent accidental unlimited runs.
+
+**Output structure** (per-year per-court per-case):
+```
+downloads/
+├── 1st Circuit/2024/22-1234_case-name/
+│   ├── docket.json
+│   ├── cluster.json      (or cluster_2.json, cluster_3.json for multiple)
+│   └── opinion.json      (or opinion_2.json, opinion_3.json for multiple)
+├── 1st Circuit/2023/...
+├── 2nd Circuit/2024/...
+├── DC Circuit/2024/...
+├── Federal Circuit/2024/...
+└── checkpoint_2020.json  (per-year checkpoint for resume capability)
+    checkpoint_2021.json
+    ...
+```
+
+### 3. Direct Scraper (Single Process, Simpler)
+
+For smaller scrapes or single-court operations, use the direct scraper:
 
 ```bash
 # Scrape recent cases from the Ninth Circuit (limited to 100 dockets)
@@ -48,17 +89,6 @@ python federal_appellate_scraper.py \
   --courts ca9 \
   --start-date 2024-01-01 \
   --max-per-court 100
-```
-
-### 3. Full scrape of all federal appellate courts
-
-```bash
-# This will take hours/days depending on date range
-python federal_appellate_scraper.py \
-  --api-token YOUR_TOKEN \
-  --mode full \
-  --start-date 2020-01-01 \
-  --end-date 2024-12-31
 ```
 
 ## Usage Examples
@@ -155,16 +185,34 @@ python federal_appellate_scraper.py \
 
 ## Output Structure
 
+### Multiprocess Orchestrator Output (`run_all_years.py`)
+
 ```
 downloads/
-├── federal_appellate_courts.json          # Court information
-├── dockets_ca1_20250220_123456.json      # Docket batches per court
-├── dockets_ca2_20250220_123500.json
-├── clusters_ca1_20250220_123600.json     # Cluster batches per court
-├── opinions_ca1_20250220_123700.json     # Opinion batches per court
-├── scraper_20250220_120000.log           # Detailed log file
-└── scraper_checkpoint.json                # Progress checkpoint
+├── 1st Circuit/
+│   ├── 2024/
+│   │   ├── 22-1234_case-name/
+│   │   │   ├── docket.json                 # case docket record
+│   │   │   ├── cluster.json                # opinion cluster (or cluster_2.json, etc)
+│   │   │   └── opinion.json                # opinion text (or opinion_2.json, etc)
+│   │   └── 22-5678_another-case/
+│   │       ├── docket.json
+│   │       └── opinion.json                # (no cluster if not published)
+│   └── 2023/...
+├── 2nd Circuit/2024/...
+├── DC Circuit/2024/...
+├── Federal Circuit/2024/...
+├── checkpoint_2024.json                    # resume checkpoint for year 2024
+├── checkpoint_2023.json                    # resume checkpoint for year 2023
+└── ... (one checkpoint per year)
 ```
+
+**Key features**:
+- Each case folder contains all 3 files (docket, cluster, opinion) when available
+- Multiple clusters/opinions per docket get suffixed: `cluster_2.json`, `opinion_3.json`, etc.
+- Year derived from docket's `date_filed`, `date_argued`, or docket number prefix
+- Per-year checkpoint files enable parallel year-processes without interference
+- Cases with no published opinion in CourtListener only have `docket.json`
 
 ## Data Structure
 
@@ -198,29 +246,96 @@ downloads/
 
 ## Rate Limiting
 
-- **Default**: 0.75 seconds between requests = ~4,800 requests/hour
 - **API Limit**: 5,000 requests/hour for authenticated users
-- **Buffer**: Built-in 200-request buffer for safety
+- **Default orchestrator budget**: 4,000 req/hr (shared across all 13 processes)
+- **Per-process effective**: ~308 req/hr (4,000 ÷ 13)
+- **Built-in buffer**: 1,000-request safety margin below API cap
+- **Burst protection**: Token bucket starts with 60 tokens (not full) to prevent spike on launch
+- **Process stagger**: 8 seconds between each child process launch
+- **Automatic rate limiting**: Token-bucket limiter ensures compliance across processes
 - The scraper automatically tracks and logs request rates
 
-## Performance Tips
+### Adjusting Rate Limit
 
-1. **Use date ranges**: Narrow your date range for faster completion
-2. **Target specific courts**: Focus on courts of interest
-3. **Use max-per-court**: Limit results for testing
-4. **Run during off-peak hours**: Better API performance
-5. **Monitor logs**: Check progress and identify issues
+If you want a more conservative budget (e.g., to avoid peak times):
+
+```bash
+# Use only 2,400 requests/hour (half quota) — safer but slower
+python run_all_years.py --all --rate-budget 2400
+
+# Use full 5,000 requests/hour (riskier, may trigger throttling)
+python run_all_years.py --all --rate-budget 5000
+```
+
+## Performance & Architecture
+
+### Multiprocess Orchestrator (`run_all_years.py`) — Recommended for Large Runs
+
+**Architecture**:
+- **13 processes** (one per year, 2013–2025)
+- **10 async workers** per process (up to 130 concurrent connections)
+- **Single shared rate limiter** (across-process, ensures API compliance)
+- **Per-year checkpoints** (safe parallel execution)
+
+**Performance**:
+- ~4-5x speedup vs. sequential (when async module available)
+- ~4,000 req/hr total rate limit (shared across all processes)
+- Each process gets ~308 req/hr effective quota
+- Test run (1 case/court/year): ~26 cases in <1 minute
+- Full run (all cases, 2013-2025): hours to days depending on data volume
+
+**When to use**:
+- Full production runs across multiple years
+- Need to maximize throughput
+- Can tolerate multiprocess overhead
+
+### Direct Scraper (`federal_appellate_scraper.py`) — Simple Alternative
+
+**Architecture**:
+- Single process, sequential court processing
+- Optional async mode (requires `aiohttp`)
+- Simple checkpoint system
+
+**Performance**:
+- Slower than multiprocess for large runs
+- Good for testing, specific courts, or small date ranges
+
+**When to use**:
+- Testing a single court or date range
+- Simple, single-process operation preferred
+- Debugging or development
 
 ## Resume Capability
 
-The scraper saves checkpoints automatically. If interrupted:
+### Multiprocess Orchestrator (`run_all_years.py`)
+
+Each year-process maintains its own checkpoint file (`checkpoint_2024.json`, `checkpoint_2025.json`, etc.). This allows:
+
+1. **Parallel safety**: Multiple year-processes don't interfere with each other's progress
+2. **Resuming after interruption**: Simply re-run the same command; already-completed courts will be skipped
+3. **Granular tracking**: See which courts are done per year
+
+```bash
+# Start a run (will be interrupted)
+python run_all_years.py --all
+
+# Later, resume: already-completed courts are skipped
+python run_all_years.py --all
+
+# Clean restart: delete checkpoints
+rm downloads/checkpoint_*.json
+python run_all_years.py --all
+```
+
+### Direct Scraper (`federal_appellate_scraper.py`)
+
+The scraper saves a single checkpoint file (`checkpoint.json`). To resume:
 
 1. The checkpoint file tracks completed courts
 2. Simply run the same command again
 3. Already-completed courts will be skipped
-4. Scraping continues from where it stopped
 
-To start fresh, delete `scraper_checkpoint.json`.
+To start fresh, delete `downloads/checkpoint.json`.
 
 ## Error Handling
 
@@ -236,6 +351,31 @@ CourtListener has maintenance windows:
 - Avoid scheduling cron jobs during this time
 
 ## Advanced Usage
+
+### Multiprocess Orchestrator Options
+
+```bash
+# Monitor status updates every 10 seconds (default: 30)
+python run_all_years.py --all --status-interval 10
+
+# Use different API token
+python run_all_years.py --all --api-token YOUR_TOKEN
+
+# Save logs to custom directory
+python run_all_years.py --all --log-dir my_logs
+
+# Save downloads to custom directory
+python run_all_years.py --all --output-dir my_downloads
+```
+
+**Live monitoring**: Follow a single year's progress in real-time:
+```bash
+# Terminal 1: start the orchestrator
+python run_all_years.py --all
+
+# Terminal 2: watch year 2020's log
+tail -f logs/scrape_2020.log
+```
 
 ### Incremental Updates
 
@@ -267,14 +407,13 @@ The scraper saves data as JSON by default. To convert to CSV:
 
 ```python
 # Example conversion script
-from federal_appellate_scraper import FederalAppellateScraper, CourtListenerAPI
+from federal_appellate_scraper import FederalAppellateScraper
 from pathlib import Path
 
-api = CourtListenerAPI("YOUR_TOKEN")
-scraper = FederalAppellateScraper(api)
+scraper = FederalAppellateScraper(api_token="YOUR_TOKEN")
 
 # Find all docket JSON files
-json_files = list(Path("downloads").glob("dockets_*.json"))
+json_files = list(Path("downloads").rglob("docket.json"))
 
 # Export to CSV
 scraper.export_to_csv(json_files, Path("downloads/all_dockets.csv"))
