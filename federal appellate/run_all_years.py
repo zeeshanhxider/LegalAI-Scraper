@@ -81,6 +81,11 @@ class SharedRateLimiter:
     every outgoing HTTP request through this single shared pool.  The bucket
     refills at `max_per_hour / 3600` tokens per second; if the bucket is empty
     the caller blocks until a token is available.
+
+    When the API returns HTTP 429, any worker can call ``pause_until(seconds)``
+    to freeze ALL token grants across every process for the Retry-After
+    duration.  This prevents a 429 cascade where hundreds of workers each
+    independently hammer the API and each receive their own 429.
     """
 
     def __init__(self, manager, max_per_hour: float = 4000):
@@ -89,22 +94,49 @@ class SharedRateLimiter:
         initial_tokens = min(60.0, float(max_per_hour))
         self._lock  = manager.Lock()
         self._state = manager.dict({
-            "tokens"    : initial_tokens,
-            "last_time" : time.time(),
-            "max_tokens": float(max_per_hour),
-            "rate"      : max_per_hour / 3600.0,   # tokens / second
+            "tokens"     : initial_tokens,
+            "last_time"  : time.time(),
+            "max_tokens" : float(max_per_hour),
+            "rate"       : max_per_hour / 3600.0,   # tokens / second
+            "paused_until": 0.0,  # epoch time; 0 = not paused
         })
+
+    def pause_until(self, seconds: float) -> None:
+        """Pause ALL token grants for ``seconds`` from now.
+
+        Called when any worker receives an HTTP 429 with a Retry-After header.
+        Only extends the pause — never shortens an existing one.
+        """
+        with self._lock:
+            s = self._state
+            resume_at = time.time() + seconds
+            if resume_at > s["paused_until"]:
+                s["paused_until"] = resume_at
+                logging.warning(
+                    f"Rate limiter PAUSED globally for {seconds:.0f}s "
+                    f"(until {time.strftime('%H:%M:%S', time.localtime(resume_at))})"
+                )
 
     def acquire(self) -> None:
         """
         Blocking call.  Returns only when a token has been consumed.
         Runs in a thread-pool executor when called from async code so it
         never blocks the event loop.
+
+        Respects global pause set by ``pause_until()``.
         """
         while True:
             with self._lock:
-                now     = time.time()
-                s       = self._state
+                now = time.time()
+                s   = self._state
+
+                # If globally paused, compute remaining wait and release lock
+                if now < s["paused_until"]:
+                    wait = s["paused_until"] - now
+                    # Cap sleep to 5s chunks so we re-check periodically
+                    time.sleep(min(wait, 5.0))
+                    continue
+
                 elapsed = now - s["last_time"]
                 tokens  = min(s["max_tokens"], s["tokens"] + elapsed * s["rate"])
                 s["last_time"] = now

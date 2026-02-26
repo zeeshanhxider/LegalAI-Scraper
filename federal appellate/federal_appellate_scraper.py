@@ -353,8 +353,12 @@ class AsyncAPI:
                                     wait_time = (2 ** attempt) * 2
                             else:
                                 wait_time = (2 ** attempt) * 2
-                            logging.warning(f"Rate limited, waiting {wait_time}s")
-                            await asyncio.sleep(wait_time)
+                            logging.warning(f"Rate limited (429), waiting {wait_time:.0f}s")
+                            # Notify the shared rate limiter to pause ALL
+                            # workers/processes, preventing a 429 cascade.
+                            if self.rate_limiter is not None and hasattr(self.rate_limiter, 'pause_until'):
+                                self.rate_limiter.pause_until(wait_time)
+                            await asyncio.sleep(min(wait_time, 30))  # this worker waits briefly; limiter handles the rest
                         elif response.status >= 500:
                             wait_time = 2 ** attempt
                             logging.warning(f"Server error {response.status}, waiting {wait_time}s")
@@ -1188,6 +1192,105 @@ class FederalAppellateScraper:
         )
         return all_opinions
 
+    def _rebuild_maps_from_disk(
+        self,
+        court_id: str,
+        year: Optional[int] = None,
+    ) -> tuple:
+        """Rebuild cluster and docket maps by scanning files already on disk.
+
+        When resuming after a crash, the in-memory maps are empty because
+        Phase 1 (clusters) was already completed in a prior run.  This method
+        scans the case folders for the given court+year and reconstructs the
+        maps from the saved JSON files.
+
+        Returns (cluster_map, docket_map) dictionaries keyed by record ID.
+        """
+        court_folder = COURT_FOLDER_NAMES.get(court_id, court_id)
+        if year is not None:
+            scan_root = self.output_dir / court_folder / str(year)
+        else:
+            scan_root = self.output_dir / court_folder
+
+        cluster_map: Dict[int, Dict] = {}
+        docket_map: Dict[int, Dict] = {}
+
+        if not scan_root.exists():
+            logging.warning(
+                f"Cannot rebuild maps: {scan_root} does not exist"
+            )
+            return cluster_map, docket_map
+
+        count_c = 0
+        count_d = 0
+        for case_dir in scan_root.iterdir():
+            if not case_dir.is_dir():
+                continue
+            # If scanning court-level (no year), descend one more level
+            if year is None:
+                for sub in case_dir.iterdir():
+                    if not sub.is_dir():
+                        continue
+                    c, d = self._load_case_maps(sub)
+                    cluster_map.update(c)
+                    docket_map.update(d)
+                    count_c += len(c)
+                    count_d += len(d)
+            else:
+                c, d = self._load_case_maps(case_dir)
+                cluster_map.update(c)
+                docket_map.update(d)
+                count_c += len(c)
+                count_d += len(d)
+
+        logging.info(
+            f"Rebuilt maps from disk for {court_id}"
+            + (f"/{year}" if year else "")
+            + f": {count_c} clusters, {count_d} dockets"
+        )
+
+        # Also populate the instance caches so opinion resolution works
+        for cid, rec in cluster_map.items():
+            self._cluster_cache[cid] = rec
+        for did, rec in docket_map.items():
+            self._docket_cache[did] = rec
+
+        return cluster_map, docket_map
+
+    @staticmethod
+    def _load_case_maps(case_dir: Path) -> tuple:
+        """Load cluster and docket records from a single case directory.
+
+        Returns (cluster_map, docket_map) for that case.
+        """
+        cluster_map: Dict[int, Dict] = {}
+        docket_map: Dict[int, Dict] = {}
+
+        # Load all cluster*.json files
+        for f in case_dir.glob("cluster*.json"):
+            try:
+                with open(f, 'r') as fh:
+                    data = json.load(fh)
+                cid = data.get('id')
+                if cid is not None:
+                    cluster_map[cid] = data
+            except Exception:
+                pass
+
+        # Load docket.json
+        docket_file = case_dir / "docket.json"
+        if docket_file.exists():
+            try:
+                with open(docket_file, 'r') as fh:
+                    data = json.load(fh)
+                did = data.get('id')
+                if did is not None:
+                    docket_map[did] = data
+            except Exception:
+                pass
+
+        return cluster_map, docket_map
+
     async def _enrich_dockets_async(
         self,
         session,
@@ -1426,13 +1529,17 @@ class FederalAppellateScraper:
         queries, constructs a partial docket.json from cluster metadata,
         then fetches opinions.
 
-        Two phases only — no individual docket API calls needed:
+        Three phases:
           Phase 1: clusters (paginated) → save cluster.json + constructed docket.json
           Phase 2: opinions (paginated) → save opinion.json
           Phase 3: docket enrichment → replace partial docket.json with full records
 
-        Each phase is parallelised across courts (A1).
-        Per-court-per-phase checkpointing survives crashes (B1).
+        On resume after a crash, in-memory maps are rebuilt from disk files
+        so that Phase 2/3 can resolve opinion→cluster→docket relationships
+        without re-fetching clusters from the API.
+
+        Each phase is parallelised across courts.
+        Per-court-per-phase checkpointing survives crashes.
         """
         scrape_start = time.time()
 
@@ -1551,6 +1658,25 @@ class FederalAppellateScraper:
                 f"{total_clusters_saved} clusters saved"
             )
 
+            # ==== Rebuild maps for courts resuming into Phase 2 ====
+            # Courts that completed clusters in a PRIOR run have empty in-memory
+            # maps.  Scan disk to reconstruct them before the opinions phase.
+            courts_resuming_opinions = [
+                c for c in courts_need_opinions
+                if c not in court_cluster_map
+            ]
+            if courts_resuming_opinions:
+                # Extract year from start_date (e.g. "2014-01-01" → 2014)
+                scan_year = int(start_date[:4]) if start_date else None
+                logging.info(
+                    f"Rebuilding maps from disk for {len(courts_resuming_opinions)} "
+                    f"courts resuming into opinions phase..."
+                )
+                for court_id in courts_resuming_opinions:
+                    cmap, dmap = self._rebuild_maps_from_disk(court_id, year=scan_year)
+                    court_cluster_map[court_id] = cmap
+                    court_docket_map[court_id] = dmap
+
             # ==== Phase 2: opinions — ALL courts in parallel ====
             phase2_start = time.time()
             if courts_need_opinions:
@@ -1592,6 +1718,22 @@ class FederalAppellateScraper:
             # with full docket records from the API.
             courts_need_enrichment = [c for c in pending_courts
                                       if self._court_phase(c) in (None, 'dockets', 'clusters', 'opinions')]
+
+            # Rebuild docket maps from disk for courts resuming into Phase 3
+            courts_resuming_enrichment = [
+                c for c in courts_need_enrichment
+                if c not in court_docket_map
+            ]
+            if courts_resuming_enrichment:
+                scan_year = int(start_date[:4]) if start_date else None
+                logging.info(
+                    f"Rebuilding docket maps from disk for {len(courts_resuming_enrichment)} "
+                    f"courts resuming into enrichment phase..."
+                )
+                for court_id in courts_resuming_enrichment:
+                    _, dmap = self._rebuild_maps_from_disk(court_id, year=scan_year)
+                    court_docket_map[court_id] = dmap
+
             phase3_start = time.time()
             if courts_need_enrichment:
                 async def phase3_court(court_id: str) -> tuple:
