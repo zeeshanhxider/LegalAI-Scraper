@@ -273,7 +273,7 @@ class SyncAPI:
 class AsyncAPI:
     """Asynchronous client for CourtListener REST API."""
     
-    MAX_CONCURRENT = 10  # 10 workers per year-process
+    MAX_CONCURRENT = 5  # concurrent connections per court (sequential courts)
     
     def __init__(self, api_token: str, rate_limit_delay: float = 0.75, rate_limiter=None):
         self.api_token = api_token
@@ -363,6 +363,10 @@ class AsyncAPI:
                             wait_time = 2 ** attempt
                             logging.warning(f"Server error {response.status}, waiting {wait_time}s")
                             await asyncio.sleep(wait_time)
+                        elif response.status == 404:
+                            # 404 during pagination = end of results (normal)
+                            logging.debug(f"HTTP 404 for {url} (end of results)")
+                            return {}
                         else:
                             logging.error(f"HTTP {response.status} for {url}")
                             return {}
@@ -1562,216 +1566,143 @@ class FederalAppellateScraper:
                                 if self._court_phase(c) in (None, 'dockets')]
         courts_need_opinions = [c for c in pending_courts
                                 if self._court_phase(c) in (None, 'dockets', 'clusters')]
+        courts_need_enrichment = [c for c in pending_courts
+                                  if self._court_phase(c) in (None, 'dockets', 'clusters', 'opinions')]
 
         async with await self.api.create_session() as session:
-            # ==== Phase 1: clusters — ALL courts in parallel ====
-            phase1_start = time.time()
-            if courts_need_clusters:
-                async def phase1_court(court_id: str) -> tuple:
-                    """Fetch clusters for one court via paginated stream."""
-                    clusters = await self._scrape_clusters_async(
-                        session, court_id, {},
-                        start_date=start_date, end_date=end_date,
-                        max_results=max_per_court,
-                    )
-                    cmap = {c['id']: c for c in clusters if c.get('id')}
-                    return court_id, cmap
-
-                logging.info(
-                    f"Phase 1: scraping clusters for {len(courts_need_clusters)} "
-                    f"courts in parallel..."
-                )
-                p1_tasks = [phase1_court(c) for c in courts_need_clusters]
-                p1_results = await asyncio.gather(*p1_tasks, return_exceptions=True)
-            else:
-                logging.info("Phase 1: all courts already have clusters checkpointed.")
-                p1_results = []
-
+            # ================================================================
+            # Process courts SEQUENTIALLY — one court at a time through all
+            # three phases.  This avoids 13 courts competing for the API
+            # simultaneously, which causes timeouts and 502s.
+            # ================================================================
             court_cluster_map: Dict[str, Dict[int, Dict]] = {}
-            for item in p1_results:
-                if isinstance(item, Exception):
-                    logging.error(f"Error in Phase 1: {item}")
-                    continue
-                court_id, cmap = item
-                court_cluster_map[court_id] = cmap
-
-            total_clusters = sum(len(m) for m in court_cluster_map.values())
-            phase1_dur = time.time() - phase1_start
-            logging.info(
-                f"Phase 1 complete: {total_clusters} clusters in {phase1_dur:.1f}s"
-            )
-
-            # Build docket map from cluster data and save cluster.json + docket.json
             court_docket_map: Dict[str, Dict[int, Dict]] = {}
+            total_clusters = 0
             total_clusters_saved = 0
             total_dockets_saved = 0
-            for court_id in courts_need_clusters:
-                cluster_map = court_cluster_map.get(court_id, {})
-                clusters = list(cluster_map.values())
-
-                # Group clusters by docket_id
-                docket_clusters: Dict[int, List[Dict]] = {}
-                for cluster in clusters:
-                    docket_id = cluster.get('docket_id')
-                    if docket_id is not None:
-                        docket_clusters.setdefault(docket_id, []).append(cluster)
-
-                # For each unique docket_id, construct a partial docket and save
-                docket_map: Dict[int, Dict] = {}
-                dockets_saved = 0
-                clusters_saved = 0
-                for docket_id, d_clusters in docket_clusters.items():
-                    # Use the first cluster to derive docket metadata
-                    first_cluster = d_clusters[0]
-                    constructed_docket = {
-                        'id': docket_id,
-                        'resource_uri': first_cluster.get('docket', ''),
-                        'case_name': first_cluster.get('case_name', ''),
-                        'case_name_short': first_cluster.get('case_name_short', ''),
-                        'date_filed': first_cluster.get('date_filed', ''),
-                        'court_id': court_id,
-                        '_partial': True,  # marker for future backfill
-                        '_source': 'constructed_from_cluster',
-                    }
-                    docket_map[docket_id] = constructed_docket
-
-                    # Save docket.json
-                    self._save_docket(constructed_docket, court_id)
-                    dockets_saved += 1
-
-                    # Save cluster.json for each cluster of this docket
-                    for cluster in d_clusters:
-                        case_dir = self._cluster_case_dir(
-                            cluster, constructed_docket, court_id
-                        )
-                        self._write_cluster(cluster, case_dir)
-                        clusters_saved += 1
-
-                court_docket_map[court_id] = docket_map
-                total_clusters_saved += clusters_saved
-                total_dockets_saved += dockets_saved
-                logging.info(
-                    f"{court_id}: saved {dockets_saved} dockets + "
-                    f"{clusters_saved} clusters"
-                )
-
-                # B1: Mark clusters phase complete per court
-                self._mark_court_phase(court_id, 'clusters')
-
-            logging.info(
-                f"Phase 1 save complete: {total_dockets_saved} dockets, "
-                f"{total_clusters_saved} clusters saved"
-            )
-
-            # ==== Rebuild maps for courts resuming into Phase 2 ====
-            # Courts that completed clusters in a PRIOR run have empty in-memory
-            # maps.  Scan disk to reconstruct them before the opinions phase.
-            courts_resuming_opinions = [
-                c for c in courts_need_opinions
-                if c not in court_cluster_map
-            ]
-            if courts_resuming_opinions:
-                # Extract year from start_date (e.g. "2014-01-01" → 2014)
-                scan_year = int(start_date[:4]) if start_date else None
-                logging.info(
-                    f"Rebuilding maps from disk for {len(courts_resuming_opinions)} "
-                    f"courts resuming into opinions phase..."
-                )
-                for court_id in courts_resuming_opinions:
-                    cmap, dmap = self._rebuild_maps_from_disk(court_id, year=scan_year)
-                    court_cluster_map[court_id] = cmap
-                    court_docket_map[court_id] = dmap
-
-            # ==== Phase 2: opinions — ALL courts in parallel ====
-            phase2_start = time.time()
-            if courts_need_opinions:
-                async def phase2_court(court_id: str) -> tuple:
-                    """Fetch opinions for one court via paginated stream."""
-                    cluster_map = court_cluster_map.get(court_id, {})
-                    docket_map  = court_docket_map.get(court_id, {})
-                    opinions = await self._scrape_opinions_async(
-                        session, court_id, cluster_map, docket_map,
-                        start_date=start_date, end_date=end_date,
-                        max_results=max_per_court,
-                    )
-                    return court_id, len(opinions)
-
-                logging.info(
-                    f"Phase 2: scraping opinions for {len(courts_need_opinions)} "
-                    f"courts in parallel..."
-                )
-                p2_tasks = [phase2_court(c) for c in courts_need_opinions]
-                p2_results = await asyncio.gather(*p2_tasks, return_exceptions=True)
-            else:
-                logging.info("Phase 2: all courts already have opinions checkpointed.")
-                p2_results = []
-
             total_opinions = 0
-            for item in p2_results:
-                if isinstance(item, Exception):
-                    logging.error(f"Error in Phase 2: {item}")
-                    continue
-                court_id, n_opinions = item
-                total_opinions += n_opinions
-                # B1: Mark opinions phase complete per court
-                self._mark_court_phase(court_id, 'opinions')
-
-            phase2_dur = time.time() - phase2_start
-            logging.info(f"Phase 2 complete: {total_opinions} opinions in {phase2_dur:.1f}s")
-
-            # ==== Phase 3: docket enrichment — ALL courts in parallel ====
-            # Replace partial docket.json files (constructed from cluster metadata)
-            # with full docket records from the API.
-            courts_need_enrichment = [c for c in pending_courts
-                                      if self._court_phase(c) in (None, 'dockets', 'clusters', 'opinions')]
-
-            # Rebuild docket maps from disk for courts resuming into Phase 3
-            courts_resuming_enrichment = [
-                c for c in courts_need_enrichment
-                if c not in court_docket_map
-            ]
-            if courts_resuming_enrichment:
-                scan_year = int(start_date[:4]) if start_date else None
-                logging.info(
-                    f"Rebuilding docket maps from disk for {len(courts_resuming_enrichment)} "
-                    f"courts resuming into enrichment phase..."
-                )
-                for court_id in courts_resuming_enrichment:
-                    _, dmap = self._rebuild_maps_from_disk(court_id, year=scan_year)
-                    court_docket_map[court_id] = dmap
-
-            phase3_start = time.time()
-            if courts_need_enrichment:
-                async def phase3_court(court_id: str) -> tuple:
-                    """Fetch full docket records to replace partial ones."""
-                    docket_map = court_docket_map.get(court_id, {})
-                    enriched = await self._enrich_dockets_async(
-                        session, court_id, docket_map,
-                    )
-                    return court_id, enriched
-
-                logging.info(
-                    f"Phase 3: enriching dockets for {len(courts_need_enrichment)} "
-                    f"courts in parallel..."
-                )
-                p3_tasks = [phase3_court(c) for c in courts_need_enrichment]
-                p3_results = await asyncio.gather(*p3_tasks, return_exceptions=True)
-            else:
-                logging.info("Phase 3: all courts already have enriched dockets.")
-                p3_results = []
-
             total_enriched = 0
-            for item in p3_results:
-                if isinstance(item, Exception):
-                    logging.error(f"Error in Phase 3: {item}")
-                    continue
-                court_id, n_enriched = item
-                total_enriched += n_enriched
-                # B1: Mark completed per court
-                self._mark_court_phase(court_id, 'completed')
 
-            phase3_dur = time.time() - phase3_start
-            logging.info(f"Phase 3 complete: {total_enriched} dockets enriched in {phase3_dur:.1f}s")
+            for court_idx, court_id in enumerate(pending_courts, 1):
+                court_start = time.time()
+                court_name = COURT_FOLDER_NAMES.get(court_id, court_id)
+                logging.info(
+                    f"[{court_idx}/{len(pending_courts)}] {court_name} ({court_id})..."
+                )
+
+                # ── Phase 1: clusters ────────────────────────────────────
+                if court_id in courts_need_clusters:
+                    logging.info(f"  Phase 1: clusters for {court_id}...")
+                    try:
+                        clusters = await self._scrape_clusters_async(
+                            session, court_id, {},
+                            start_date=start_date, end_date=end_date,
+                            max_results=max_per_court,
+                        )
+                    except Exception as exc:
+                        logging.error(f"  Phase 1 FAILED for {court_id}: {exc}")
+                        clusters = []
+
+                    cmap = {c['id']: c for c in clusters if c.get('id')}
+                    court_cluster_map[court_id] = cmap
+                    total_clusters += len(cmap)
+
+                    # Group clusters by docket_id and save
+                    docket_clusters: Dict[int, List[Dict]] = {}
+                    for cluster in cmap.values():
+                        docket_id = cluster.get('docket_id')
+                        if docket_id is not None:
+                            docket_clusters.setdefault(docket_id, []).append(cluster)
+
+                    docket_map: Dict[int, Dict] = {}
+                    dockets_saved = 0
+                    clusters_saved = 0
+                    for docket_id, d_clusters in docket_clusters.items():
+                        first_cluster = d_clusters[0]
+                        constructed_docket = {
+                            'id': docket_id,
+                            'resource_uri': first_cluster.get('docket', ''),
+                            'case_name': first_cluster.get('case_name', ''),
+                            'case_name_short': first_cluster.get('case_name_short', ''),
+                            'date_filed': first_cluster.get('date_filed', ''),
+                            'court_id': court_id,
+                            '_partial': True,
+                            '_source': 'constructed_from_cluster',
+                        }
+                        docket_map[docket_id] = constructed_docket
+                        self._save_docket(constructed_docket, court_id)
+                        dockets_saved += 1
+
+                        for cluster in d_clusters:
+                            case_dir = self._cluster_case_dir(
+                                cluster, constructed_docket, court_id
+                            )
+                            self._write_cluster(cluster, case_dir)
+                            clusters_saved += 1
+
+                    court_docket_map[court_id] = docket_map
+                    total_clusters_saved += clusters_saved
+                    total_dockets_saved += dockets_saved
+                    logging.info(
+                        f"  {court_id}: saved {dockets_saved} dockets + "
+                        f"{clusters_saved} clusters"
+                    )
+                    self._mark_court_phase(court_id, 'clusters')
+
+                # ── Phase 2: opinions ────────────────────────────────────
+                if court_id in courts_need_opinions:
+                    # Rebuild maps from disk if needed (resuming)
+                    if court_id not in court_cluster_map:
+                        scan_year = int(start_date[:4]) if start_date else None
+                        logging.info(f"  Rebuilding maps from disk for {court_id}...")
+                        cmap, dmap = self._rebuild_maps_from_disk(court_id, year=scan_year)
+                        court_cluster_map[court_id] = cmap
+                        court_docket_map[court_id] = dmap
+
+                    cluster_map = court_cluster_map.get(court_id, {})
+                    docket_map_  = court_docket_map.get(court_id, {})
+
+                    logging.info(f"  Phase 2: opinions for {court_id}...")
+                    try:
+                        opinions = await self._scrape_opinions_async(
+                            session, court_id, cluster_map, docket_map_,
+                            start_date=start_date, end_date=end_date,
+                            max_results=max_per_court,
+                        )
+                        n_opinions = len(opinions)
+                    except Exception as exc:
+                        logging.error(f"  Phase 2 FAILED for {court_id}: {exc}")
+                        n_opinions = 0
+
+                    total_opinions += n_opinions
+                    self._mark_court_phase(court_id, 'opinions')
+
+                # ── Phase 3: docket enrichment ───────────────────────────
+                if court_id in courts_need_enrichment:
+                    # Rebuild docket map from disk if needed
+                    if court_id not in court_docket_map:
+                        scan_year = int(start_date[:4]) if start_date else None
+                        _, dmap = self._rebuild_maps_from_disk(court_id, year=scan_year)
+                        court_docket_map[court_id] = dmap
+
+                    docket_map_enrich = court_docket_map.get(court_id, {})
+
+                    logging.info(f"  Phase 3: enriching {len(docket_map_enrich)} dockets for {court_id}...")
+                    try:
+                        n_enriched = await self._enrich_dockets_async(
+                            session, court_id, docket_map_enrich,
+                        )
+                    except Exception as exc:
+                        logging.error(f"  Phase 3 FAILED for {court_id}: {exc}")
+                        n_enriched = 0
+
+                    total_enriched += n_enriched
+                    self._mark_court_phase(court_id, 'completed')
+
+                court_dur = time.time() - court_start
+                logging.info(
+                    f"  {court_name} complete in {court_dur:.1f}s"
+                )
 
             # Summary
             scrape_dur = time.time() - scrape_start

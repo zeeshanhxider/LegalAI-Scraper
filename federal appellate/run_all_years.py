@@ -69,7 +69,7 @@ load_dotenv()
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULT_TOKEN       = os.environ.get("COURTLISTENER_TOKEN", "")
 ALL_YEARS           = list(range(2013, 2026))   # 2013 … 2025  →  13 years
-WORKERS_PER_PROCESS = 10
+WORKERS_PER_PROCESS = 5
 PROCESS_STAGGER_SEC = 8    # seconds between launching each child process
 
 
