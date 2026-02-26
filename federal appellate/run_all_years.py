@@ -1,50 +1,54 @@
 #!/usr/bin/env python3
 """
-run_all_years.py — Multiprocess + async orchestrator for the federal appellate scraper.
+run_all_years.py — Orchestrator for the federal appellate scraper.
 
-Architecture
-────────────
-   Main process
-    └─ spawns N child processes  (one per year, via multiprocessing.spawn)
-         └─ each child runs an asyncio event loop
-              └─ up to 10 concurrent aiohttp workers per process
-                   └─ all workers share ONE cross-process token-bucket rate limiter
+Modes
+─────
+  SEQUENTIAL (default, recommended):
+    Runs years one at a time in the main process.
+    Each year gets the FULL rate budget (4000 req/hr) with 10 async workers.
+    Much faster per-year completion. No multiprocessing overhead.
+
+  PARALLEL (--parallel):
+    Spawns N child processes (one per year) sharing the rate budget.
+    Each process effectively gets budget/N req/hr — rarely useful since the
+    API rate limit (not parallelism) is the bottleneck.
 
 Rate limiting
 ─────────────
-  Total API budget : 4000 req/hr  (hard cap shared across ALL processes + workers)
-  Cross-process safety via multiprocessing.Manager Lock + dict
-  Initial burst protection: bucket starts with 60 tokens (not full) to prevent spikes
-  Process stagger: 8 seconds between each child launch
+  Total API budget : 4000 req/hr  (hard cap)
+  Sequential mode  : single-process async limiter (no cross-process overhead)
+  Parallel mode    : cross-process token-bucket via multiprocessing.Manager
 
 Checkpoints
 ───────────
-  Each year-process writes its own  downloads/checkpoint_{year}.json
-  so that parallel processes never interfere with each other's progress.
+  Each year writes its own  downloads/checkpoint_{year}.json
   Re-running after a partial failure will skip already-completed courts
   for that year only.
 
 Logging
 ───────
-  Each year-process writes to:  logs/scrape_{year}.log
-  Main process prints a live status table every N seconds.
+  Each year writes to:  logs/scrape_{year}.log
   Follow a single year:  tail -f logs/scrape_2018.log
 
 Usage
 ─────
-  # Run all 13 years, unlimited cases (full production run)
+  # Full production run, sequential (recommended)
   python run_all_years.py --all
 
-  # Test run: 1 case per court per year  (fast verification)
+  # Test run: 1 case per court per year
   python run_all_years.py --limit 1
 
-  # Specific years, 100 cases/court/year
-  python run_all_years.py --years 2020 2021 --limit 100
+  # Specific years only
+  python run_all_years.py --years 2020 2021 --all
 
   # Specific courts only
   python run_all_years.py --limit 10 --courts ca1 ca9 cadc
 
-  # Conservative rate budget (half quota)
+  # Parallel mode (not recommended — splits rate budget across processes)
+  python run_all_years.py --all --parallel
+
+  # Conservative rate budget
   python run_all_years.py --all --rate-budget 2400
 """
 
@@ -72,6 +76,55 @@ PROCESS_STAGGER_SEC = 8    # seconds between launching each child process
 # ══════════════════════════════════════════════════════════════════════════════
 #  SHARED CROSS-PROCESS TOKEN-BUCKET RATE LIMITER
 # ══════════════════════════════════════════════════════════════════════════════
+
+class LocalRateLimiter:
+    """Single-process token-bucket rate limiter for sequential mode.
+
+    Functionally identical to SharedRateLimiter but without multiprocessing
+    overhead.  Safe for use from multiple asyncio workers within one process
+    (via ``run_in_executor``).
+
+    Also exposes ``pause_until(seconds)`` so the 429 handler in AsyncAPI
+    works identically in both sequential and parallel mode.
+    """
+
+    def __init__(self, max_per_hour: float = 4000):
+        import threading
+        self._lock = threading.Lock()
+        initial_tokens = min(60.0, float(max_per_hour))
+        self._tokens       = initial_tokens
+        self._last_time    = time.time()
+        self._max_tokens   = float(max_per_hour)
+        self._rate         = max_per_hour / 3600.0
+        self._paused_until = 0.0
+
+    def pause_until(self, seconds: float) -> None:
+        with self._lock:
+            resume_at = time.time() + seconds
+            if resume_at > self._paused_until:
+                self._paused_until = resume_at
+                logging.warning(
+                    f"Rate limiter PAUSED for {seconds:.0f}s "
+                    f"(until {time.strftime('%H:%M:%S', time.localtime(resume_at))})"
+                )
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.time()
+                if now < self._paused_until:
+                    wait = self._paused_until - now
+                    time.sleep(min(wait, 5.0))
+                    continue
+                elapsed = now - self._last_time
+                self._tokens = min(self._max_tokens, self._tokens + elapsed * self._rate)
+                self._last_time = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            time.sleep(min(wait, 0.5))
+
 
 class SharedRateLimiter:
     """
@@ -150,24 +203,11 @@ class SharedRateLimiter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CHILD-PROCESS WORKER  (must be a top-level function for multiprocessing spawn)
+#  YEAR WORKERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def year_worker(
-    year: int,
-    args_dict: dict,
-    rate_limiter: SharedRateLimiter,
-    log_dir: str,
-) -> None:
-    """
-    Runs inside a dedicated child process.
-
-    Sets up file-based logging for this year, then drives the async scraper
-    (up to 10 concurrent aiohttp workers) against the CourtListener API.
-    Each process uses its own checkpoint_{year}.json so processes don't
-    interfere with each other.
-    """
-    # ── per-year logging ────────────────────────────────────────────────────
+def _setup_year_logging(year: int, log_dir: str) -> None:
+    """Configure per-year file + console logging."""
     log_path = Path(log_dir) / f"scrape_{year}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -187,7 +227,21 @@ def year_worker(
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    # ── import scraper from same directory ──────────────────────────────────
+
+def _run_year(
+    year: int,
+    args_dict: dict,
+    log_dir: str,
+    rate_limiter=None,
+) -> None:
+    """Run the scraper for a single year.
+
+    Works both as a standalone call (sequential mode) and inside a child
+    process (parallel mode).  When *rate_limiter* is ``None`` a local
+    single-process token-bucket limiter is created automatically.
+    """
+    _setup_year_logging(year, log_dir)
+
     here = str(Path(__file__).parent)
     if here not in sys.path:
         sys.path.insert(0, here)
@@ -197,6 +251,14 @@ def year_worker(
     output_dir = str(Path(args_dict["output_dir"]))
     courts     = args_dict.get("courts") or CIRCUIT_COURTS
 
+    # Create a local rate limiter for sequential mode (full budget, single process)
+    if rate_limiter is None:
+        budget = args_dict.get("rate_budget", 4000)
+        rate_limiter = LocalRateLimiter(max_per_hour=budget)
+        limiter_mode = f"local ({int(budget)} req/hr)"
+    else:
+        limiter_mode = "shared (cross-process)"
+
     logging.info("")
     logging.info("=" * 80)
     logging.info(f"=== Year {year} started  (PID {os.getpid()}) ===")
@@ -205,13 +267,14 @@ def year_worker(
     logging.info(f"    limit      : {args_dict.get('limit') or 'unlimited (--all)'}")
     logging.info(f"    output     : {output_dir}/{{Circuit Name}}/{year}/{{case}}/")
     logging.info(f"    checkpoint : {output_dir}/checkpoint_{year}.json")
+    logging.info(f"    limiter    : {limiter_mode}")
 
     scraper = FederalAppellateScraper(
         api_token    = args_dict["api_token"],
         output_dir   = output_dir,
-        use_async    = True,           # always async inside each process
-        rate_limiter = rate_limiter,   # shared cross-process bucket
-        year         = year,           # per-year checkpoint isolation
+        use_async    = True,
+        rate_limiter = rate_limiter,
+        year         = year,
     )
 
     try:
@@ -219,12 +282,22 @@ def year_worker(
             courts        = courts,
             start_date    = f"{year}-01-01",
             end_date      = f"{year}-12-31",
-            max_per_court = args_dict.get("limit"),  # None = unlimited
+            max_per_court = args_dict.get("limit"),
         )
         logging.info(f"=== Year {year} COMPLETE ===")
     except Exception as exc:
         logging.exception(f"=== Year {year} FAILED: {exc} ===")
         raise
+
+
+def year_worker(
+    year: int,
+    args_dict: dict,
+    rate_limiter: SharedRateLimiter,
+    log_dir: str,
+) -> None:
+    """Parallel-mode child-process entry point (multiprocessing.spawn)."""
+    _run_year(year, args_dict, log_dir, rate_limiter=rate_limiter)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -299,23 +372,26 @@ def print_status(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Multiprocess + async orchestrator — "
-            "13 processes x 10 async workers, shared rate limiter, per-year checkpoints"
+            "Orchestrator for the federal appellate scraper — "
+            "sequential (default) or parallel mode, async workers, per-year checkpoints"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples
-  # Full production run (unlimited cases, all years, all courts)
+  # Full production run, sequential (recommended — full rate budget per year)
   python run_all_years.py --all
 
-  # Quick test: 1 case per court per year
-  python run_all_years.py --limit 1
+  # Quick test: 1 case per court
+  python run_all_years.py --limit 1 --years 2025 --courts ca9
 
-  # Specific years, 100 cases/court/year
-  python run_all_years.py --years 2020 2021 2022 --limit 100
+  # Specific years, 50 cases/court/year
+  python run_all_years.py --years 2020 2021 --limit 50
 
   # Specific courts only
   python run_all_years.py --limit 10 --courts ca1 ca9 cadc
+
+  # Parallel mode (splits rate budget across processes — rarely useful)
+  python run_all_years.py --all --parallel
 
   # Conservative rate budget (half quota, ~2400 req/hr)
   python run_all_years.py --all --rate-budget 2400
@@ -361,7 +437,15 @@ Examples
         "--status-interval",
         type=int,
         default=30,
-        help="Seconds between live status table prints (default: 30)",
+        help="Seconds between live status table prints in parallel mode (default: 30)",
+    )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help=(
+            "Run years in parallel (one process per year, shared rate budget). "
+            "Default is sequential — each year gets the full rate budget."
+        ),
     )
     args = parser.parse_args()
 
@@ -386,23 +470,28 @@ Examples
 
     # ── build picklable args dict ────────────────────────────────────────────
     args_dict = {
-        "api_token"  : args.api_token,
-        "output_dir" : args.output_dir,
-        "limit"      : limit,
-        "courts"     : args.courts,
+        "api_token"   : args.api_token,
+        "output_dir"  : args.output_dir,
+        "limit"       : limit,
+        "courts"      : args.courts,
+        "rate_budget" : args.rate_budget,
     }
 
-    Path(args.log_dir).mkdir(parents=True, exist_ok=True)
-
     courts_display = ", ".join(args.courts) if args.courts else f"all {len(__import__('federal_appellate_scraper').CIRCUIT_COURTS) if False else 13}"
+    mode_str = "PARALLEL" if args.parallel else "SEQUENTIAL"
     print("=" * 72)
-    print("  Federal Appellate Scraper  —  Multiprocess Orchestrator")
+    print("  Federal Appellate Scraper  —  Orchestrator")
     print("=" * 72)
-    print(f"  Processes     : {len(years)} (one per year)")
-    print(f"  Workers/proc  : {WORKERS_PER_PROCESS} async workers")
-    print(f"  Total slots   : {len(years) * WORKERS_PER_PROCESS} concurrent connections")
-    print(f"  Rate budget   : {int(args.rate_budget):,} req/hr  SHARED across all processes")
-    print(f"  Per-process   : ~{int(args.rate_budget / max(len(years), 1)):,} req/hr effective")
+    print(f"  Mode          : {mode_str}")
+    if args.parallel:
+        print(f"  Processes     : {len(years)} (one per year)")
+        print(f"  Workers/proc  : {WORKERS_PER_PROCESS} async workers")
+        print(f"  Total slots   : {len(years) * WORKERS_PER_PROCESS} concurrent connections")
+        print(f"  Rate budget   : {int(args.rate_budget):,} req/hr  SHARED across all processes")
+        print(f"  Per-process   : ~{int(args.rate_budget / max(len(years), 1)):,} req/hr effective")
+    else:
+        print(f"  Workers       : {WORKERS_PER_PROCESS} async workers")
+        print(f"  Rate budget   : {int(args.rate_budget):,} req/hr  (full budget per year)")
     print(f"  Limit         : {limit or 'unlimited (--all)'} per court per year")
     print(f"  Years         : {', '.join(str(y) for y in years)}")
     print(f"  Courts        : {', '.join(args.courts) if args.courts else 'all 13'}")
@@ -412,53 +501,92 @@ Examples
     print("=" * 72)
     print(f"\nTip: tail -f {args.log_dir}/scrape_{years[0]}.log   (follow any year live)\n")
 
-    # ── shared rate limiter via Manager ─────────────────────────────────────
-    mp_ctx   = multiprocessing.get_context("spawn")
-    manager  = mp_ctx.Manager()
-    rate_lim = SharedRateLimiter(manager, max_per_hour=args.rate_budget)
+    Path(args.log_dir).mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
-    processes: list = []
 
-    for year in years:
-        p = mp_ctx.Process(
-            target = year_worker,
-            args   = (year, args_dict, rate_lim, args.log_dir),
-            name   = f"scraper-{year}",
-            daemon = False,
-        )
-        p.start()
-        print(f"  Started PID {str(p.pid):<7} → year {year}   "
-              f"log: {args.log_dir}/scrape_{year}.log")
-        processes.append(p)
-        time.sleep(PROCESS_STAGGER_SEC)
+    if args.parallel:
+        # ── PARALLEL MODE: multiprocessing with shared rate limiter ───────
+        mp_ctx   = multiprocessing.get_context("spawn")
+        manager  = mp_ctx.Manager()
+        rate_lim = SharedRateLimiter(manager, max_per_hour=args.rate_budget)
 
-    print(f"\n{len(processes)} processes running. "
-          f"Status update every {args.status_interval}s  (Ctrl-C to stop all)\n")
+        processes: list = []
+        for year in years:
+            p = mp_ctx.Process(
+                target = year_worker,
+                args   = (year, args_dict, rate_lim, args.log_dir),
+                name   = f"scraper-{year}",
+                daemon = True,   # die with parent — prevents orphaned processes
+            )
+            p.start()
+            print(f"  Started PID {str(p.pid):<7} → year {year}   "
+                  f"log: {args.log_dir}/scrape_{year}.log")
+            processes.append(p)
+            time.sleep(PROCESS_STAGGER_SEC)
 
-    # ── monitor loop ─────────────────────────────────────────────────────────
-    try:
-        while any(p.is_alive() for p in processes):
-            time.sleep(args.status_interval)
-            print_status(years, args.log_dir, processes, start_time, args.output_dir)
-    except KeyboardInterrupt:
-        print("\n\nInterrupt — terminating all child processes …")
+        print(f"\n{len(processes)} processes running. "
+              f"Status update every {args.status_interval}s  (Ctrl-C to stop all)\n")
+
+        try:
+            while any(p.is_alive() for p in processes):
+                time.sleep(args.status_interval)
+                print_status(years, args.log_dir, processes, start_time, args.output_dir)
+        except KeyboardInterrupt:
+            print("\n\nInterrupt — terminating all child processes …")
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+
         for p in processes:
-            if p.is_alive():
-                p.terminate()
+            p.join(timeout=15)
 
-    for p in processes:
-        p.join(timeout=15)
+        elapsed = time.time() - start_time
+        success = sum(1 for p in processes if p.exitcode == 0)
+        failed  = len(processes) - success
 
-    elapsed = time.time() - start_time
-    success = sum(1 for p in processes if p.exitcode == 0)
-    failed  = len(processes) - success
+        print("\n" + "=" * 72)
+        print(f"  Finished in {elapsed / 3600:.2f} hours")
+        print(f"  Success: {success}/{len(processes)}    Failed: {failed}/{len(processes)}")
+        print(f"  Logs: {args.log_dir}/")
+        print("=" * 72)
 
-    print("\n" + "=" * 72)
-    print(f"  Finished in {elapsed / 3600:.2f} hours")
-    print(f"  Success: {success}/{len(processes)}    Failed: {failed}/{len(processes)}")
-    print(f"  Logs: {args.log_dir}/")
-    print("=" * 72)
+    else:
+        # ── SEQUENTIAL MODE: one year at a time, full rate budget ─────────
+        completed = 0
+        failed_years: list[int] = []
+
+        for i, year in enumerate(years, 1):
+            print(f"\n{'─' * 72}")
+            print(f"  [{i}/{len(years)}]  Year {year}   "
+                  f"(rate budget: {int(args.rate_budget):,} req/hr)")
+            print(f"{'─' * 72}")
+
+            try:
+                _run_year(year, args_dict, args.log_dir, rate_limiter=None)
+                completed += 1
+            except KeyboardInterrupt:
+                print(f"\n\nInterrupt during year {year} — stopping.")
+                print(f"  Resume with: python run_all_years.py "
+                      f"{'--all' if limit is None else f'--limit {limit}'} "
+                      f"--years {' '.join(str(y) for y in years[i-1:])}")
+                break
+            except Exception as exc:
+                logging.error(f"Year {year} failed: {exc}")
+                failed_years.append(year)
+                continue
+
+        elapsed = time.time() - start_time
+        print("\n" + "=" * 72)
+        print(f"  Finished in {elapsed / 3600:.2f} hours")
+        print(f"  Completed: {completed}/{len(years)}")
+        if failed_years:
+            print(f"  Failed: {', '.join(str(y) for y in failed_years)}")
+            print(f"  Re-run: python run_all_years.py "
+                  f"{'--all' if limit is None else f'--limit {limit}'} "
+                  f"--years {' '.join(str(y) for y in failed_years)}")
+        print(f"  Logs: {args.log_dir}/")
+        print("=" * 72)
 
 
 if __name__ == "__main__":

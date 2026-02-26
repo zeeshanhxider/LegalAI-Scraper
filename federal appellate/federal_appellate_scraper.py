@@ -1102,6 +1102,7 @@ class FederalAppellateScraper:
         docket_map: Dict[int, Dict],
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        max_results: Optional[int] = None,
     ) -> List[Dict]:
         """Scrape clusters for a court using a single paginated court-wide query.
 
@@ -1123,7 +1124,8 @@ class FederalAppellateScraper:
         logging.info(f"Cluster scrape for {court_id}: fetching court-wide paginated stream...")
 
         phase_start = time.time()
-        all_clusters = await self.api.get_paginated(session, 'clusters/', params)
+        all_clusters = await self.api.get_paginated(session, 'clusters/', params,
+                                                     max_results=max_results)
 
         # Populate the cluster cache
         for cluster in all_clusters:
@@ -1146,6 +1148,7 @@ class FederalAppellateScraper:
         docket_map: Dict[int, Dict],
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        max_results: Optional[int] = None,
     ) -> List[Dict]:
         """Scrape opinions for a court using a single paginated court-wide query.
 
@@ -1167,7 +1170,8 @@ class FederalAppellateScraper:
         logging.info(f"Opinion scrape for {court_id}: fetching court-wide paginated stream...")
 
         phase_start = time.time()
-        all_opinions = await self.api.get_paginated(session, 'opinions/', params)
+        all_opinions = await self.api.get_paginated(session, 'opinions/', params,
+                                                     max_results=max_results)
 
         # Save each opinion to disk (only if its cluster is in our map)
         saved_count = 0
@@ -1568,6 +1572,7 @@ class FederalAppellateScraper:
                     clusters = await self._scrape_clusters_async(
                         session, court_id, {},
                         start_date=start_date, end_date=end_date,
+                        max_results=max_per_court,
                     )
                     cmap = {c['id']: c for c in clusters if c.get('id')}
                     return court_id, cmap
@@ -1687,6 +1692,7 @@ class FederalAppellateScraper:
                     opinions = await self._scrape_opinions_async(
                         session, court_id, cluster_map, docket_map,
                         start_date=start_date, end_date=end_date,
+                        max_results=max_per_court,
                     )
                     return court_id, len(opinions)
 
