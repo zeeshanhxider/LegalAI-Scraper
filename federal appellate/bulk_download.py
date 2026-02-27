@@ -24,9 +24,10 @@ import json
 import logging
 import os
 import re
-import subprocess
+import ssl
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,10 @@ COURT_NAMES = {
 DOWNLOAD_DIR = Path("downloads")
 TEMP_DIR = Path("bulk_temp")
 
+# Raise CSV field size limit — opinion text fields easily exceed the 128 KB default.
+# Use the largest value the platform supports.
+csv.field_size_limit(min(sys.maxsize, 2_147_483_647))
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -72,32 +77,34 @@ log = logging.getLogger("bulk")
 # Streaming CSV reader via curl | bunzip2 pipe
 # ---------------------------------------------------------------------------
 
+def _make_ssl_context():
+    """
+    Return an SSL context that verifies certificates.
+    Uses certifi's CA bundle if available (needed on macOS with framework Python).
+    On Windows, the default context uses the system cert store and works fine.
+    """
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+    return ctx
+
+
 def stream_csv_rows(filename, desc=""):
     """
     Stream a bz2-compressed CSV from S3, yielding dicts row by row.
-    Uses curl | bunzip2 pipe so the full file never touches disk.
+    Uses Python's built-in urllib.request + bz2 — no external binaries
+    required, so this works on Windows, Mac, and Linux.
     Memory usage: ~one CSV row at a time.
     """
     url = f"{BASE_URL}/{filename}"
     log.info(f"Streaming {desc or filename} from {url} ...")
 
-    # Use curl to stream and bunzip2 to decompress
-    curl_proc = subprocess.Popen(
-        ["curl", "-sS", "--fail", "-L", url],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    bunzip_proc = subprocess.Popen(
-        ["bunzip2", "-c"],
-        stdin=curl_proc.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    # Allow curl to receive SIGPIPE if bunzip2 exits
-    curl_proc.stdout.close()
-
-    # Wrap bunzip2 stdout as a text stream
-    text_stream = io.TextIOWrapper(bunzip_proc.stdout, encoding="utf-8", errors="replace")
+    ctx = _make_ssl_context()
+    response = urllib.request.urlopen(url, context=ctx)
+    bz2_reader = bz2.BZ2File(response)
+    text_stream = io.TextIOWrapper(bz2_reader, encoding="utf-8", errors="replace")
 
     reader = csv.DictReader(text_stream)
     row_count = 0
@@ -112,19 +119,10 @@ def stream_csv_rows(filename, desc=""):
             yield row
     finally:
         text_stream.close()
-        bunzip_proc.wait()
-        curl_proc.wait()
+        bz2_reader.close()
+        response.close()
         elapsed = time.time() - t0
         log.info(f"  {desc}: done — {row_count:,} total rows in {elapsed:.0f}s")
-
-        # Check for errors
-        if curl_proc.returncode != 0:
-            err = curl_proc.stderr.read().decode() if curl_proc.stderr else ""
-            log.error(f"curl failed (rc={curl_proc.returncode}): {err[:500]}")
-        if bunzip_proc.returncode not in (0, None):
-            err = bunzip_proc.stderr.read().decode() if bunzip_proc.stderr else ""
-            if "Broken pipe" not in err:  # Expected if we stop early
-                log.error(f"bunzip2 failed (rc={bunzip_proc.returncode}): {err[:500]}")
 
 
 # ---------------------------------------------------------------------------
