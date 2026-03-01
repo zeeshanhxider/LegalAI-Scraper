@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import os
+import pickle
 import re
 import ssl
 import sys
@@ -57,6 +58,7 @@ COURT_NAMES = {
 
 DOWNLOAD_DIR = Path("downloads")
 TEMP_DIR = Path("bulk_temp")
+CHECKPOINT_DIR = Path("bulk_checkpoints")
 
 # Raise CSV field size limit — opinion text fields easily exceed the 128 KB default.
 # Use the largest value the platform supports.
@@ -72,6 +74,30 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("bulk")
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers — save/load Phase 1 & 2 results so a re-run skips them
+# ---------------------------------------------------------------------------
+
+def _checkpoint_path(name: str) -> Path:
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    return CHECKPOINT_DIR / f"{name}.pkl"
+
+def save_checkpoint(name: str, data) -> None:
+    path = _checkpoint_path(name)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+    log.info(f"Checkpoint saved: {path}")
+
+def load_checkpoint(name: str):
+    path = _checkpoint_path(name)
+    if path.exists():
+        log.info(f"Loading checkpoint: {path}")
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return None
 
 # ---------------------------------------------------------------------------
 # Streaming CSV reader via curl | bunzip2 pipe
@@ -387,9 +413,15 @@ def _opinion_row_to_dict(row: dict) -> dict:
             text = val
             break
 
+    def _safe_int(val):
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
     return {
-        "id": int(row["id"]) if row.get("id") else None,
-        "cluster_id": int(row["cluster_id"]) if row.get("cluster_id") else None,
+        "id": _safe_int(row.get("id")),
+        "cluster_id": _safe_int(row.get("cluster_id")),
         "date_created": row.get("date_created", ""),
         "date_modified": row.get("date_modified", ""),
         "author_str": row.get("author_str", ""),
@@ -493,15 +525,26 @@ def run_full(start_year: int, end_year: int, dry_run: bool = False):
     """Execute the full bulk download pipeline."""
     t0 = time.time()
 
-    # Phase 1: dockets (streaming, ~4.7GB compressed)
-    # We keep all federal appellate dockets in memory — expect ~500K-1M entries
-    # Each entry is ~500 bytes, so ~500MB max. Acceptable.
-    dockets = phase1_dockets()
+    # Phase 1: dockets — load from checkpoint if available
+    cached = load_checkpoint("phase1_dockets")
+    if cached is not None:
+        dockets = cached
+        log.info(f"Phase 1 loaded from checkpoint: {len(dockets):,} dockets")
+    else:
+        dockets = phase1_dockets()
+        save_checkpoint("phase1_dockets", dockets)
     docket_ids = set(dockets.keys())
     log.info(f"Memory: ~{len(dockets) * 500 / 1024 / 1024:.0f}MB for dockets dict")
 
-    # Phase 2: clusters (streaming, ~2.3GB compressed)
-    clusters, cluster_to_docket = phase2_clusters(docket_ids, start_year, end_year)
+    # Phase 2: clusters — load from checkpoint if available
+    cache_key = f"phase2_clusters_{start_year}_{end_year}"
+    cached2 = load_checkpoint(cache_key)
+    if cached2 is not None:
+        clusters, cluster_to_docket = cached2
+        log.info(f"Phase 2 loaded from checkpoint: {len(clusters):,} clusters")
+    else:
+        clusters, cluster_to_docket = phase2_clusters(docket_ids, start_year, end_year)
+        save_checkpoint(cache_key, (clusters, cluster_to_docket))
     cluster_ids = set(clusters.keys())
     log.info(f"Memory: ~{len(clusters) * 1000 / 1024 / 1024:.0f}MB for clusters dict")
 
