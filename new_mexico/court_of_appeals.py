@@ -282,7 +282,14 @@ def selenium_get_listing_html(driver: webdriver.Chrome, url: str, timeout: int, 
     return driver.page_source
 
 
-def download_pdf(session: requests.Session, pdf_url: str, pdf_path: Path, logger: logging.Logger) -> bool:
+def download_pdf(
+    session: requests.Session,
+    pdf_url: str,
+    pdf_path: Path,
+    logger: logging.Logger,
+    referer: str = "",
+    max_retries: int = 3,
+) -> bool:
     if not pdf_url:
         return False
 
@@ -293,17 +300,60 @@ def download_pdf(session: requests.Session, pdf_url: str, pdf_path: Path, logger
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(f"Download PDF: {pdf_url}")
 
-    with session.get(pdf_url, stream=True, timeout=90) as r:
-        r.raise_for_status()
-        with pdf_path.open("wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 128):
-                if chunk:
-                    f.write(chunk)
+    extra_headers: Dict[str, str] = {}
+    if referer:
+        extra_headers["Referer"] = referer
+    extra_headers["Accept"] = "application/pdf,*/*;q=0.8"
 
-    ok = pdf_path.exists() and pdf_path.stat().st_size > 0
-    if ok:
-        logger.info(f"Saved PDF: {pdf_path}")
-    return ok
+    for attempt in range(1, max_retries + 1):
+        try:
+            with session.get(
+                pdf_url,
+                stream=True,
+                timeout=90,
+                headers=extra_headers,
+            ) as r:
+                if r.status_code in (403, 429, 500, 502, 503, 504) and attempt < max_retries:
+                    wait_s = attempt * 2
+                    logger.warning(
+                        f"PDF retry {attempt}/{max_retries} (status={r.status_code}) for {pdf_url}; "
+                        f"sleep {wait_s}s"
+                    )
+                    time.sleep(wait_s)
+                    continue
+
+                r.raise_for_status()
+                with pdf_path.open("wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 128):
+                        if chunk:
+                            f.write(chunk)
+
+            ok = pdf_path.exists() and pdf_path.stat().st_size > 0
+            if ok:
+                logger.info(f"Saved PDF: {pdf_path}")
+                return True
+
+            logger.warning(f"Downloaded file is empty: {pdf_url}")
+            return False
+
+        except requests.RequestException as e:
+            if attempt < max_retries:
+                wait_s = attempt * 2
+                logger.warning(
+                    f"PDF attempt {attempt}/{max_retries} failed for {pdf_url}: {e}; retry in {wait_s}s"
+                )
+                time.sleep(wait_s)
+                continue
+
+            logger.error(f"PDF download failed after {max_retries} attempts: {pdf_url} | error={e}")
+            break
+
+    if pdf_path.exists() and pdf_path.stat().st_size == 0:
+        try:
+            pdf_path.unlink()
+        except Exception:
+            pass
+    return False
 
 
 def main():
@@ -402,7 +452,7 @@ def main():
 
                         pdf_local_path = ""
                         if pdf_url:
-                            if download_pdf(session, pdf_url, pdf_path, logger):
+                            if download_pdf(session, pdf_url, pdf_path, logger, referer=item_url):
                                 pdf_local_path = str(pdf_path.as_posix())
 
                         row = CaseRow(
