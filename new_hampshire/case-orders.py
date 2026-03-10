@@ -28,7 +28,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 
 BASE_URL = "https://www.courts.nh.gov"
-START_YEAR = 2002
+START_YEAR = 2015
 CURRENT_YEAR = datetime.now().year
 
 CSV_COLUMNS = [
@@ -40,11 +40,11 @@ CSV_COLUMNS = [
 ]
 
 ROOT_DIR = Path(__file__).resolve().parent
-DOWNLOADS_DIR = ROOT_DIR / "downloads/supreme_court"
+DOWNLOADS_DIR = ROOT_DIR / "downloads/case_orders"
 CSV_DIR = DOWNLOADS_DIR / "CSV"
 PDF_DIR = DOWNLOADS_DIR / "PDF"
 LOG_DIR = ROOT_DIR / "Log"
-CSV_PATH = CSV_DIR / "nh_supreme_court_opinions.csv"
+CSV_PATH = CSV_DIR / "nh_case_orders.csv"
 
 DESKTOP_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -54,7 +54,7 @@ DESKTOP_USER_AGENT = (
 
 
 def build_year_url(year: int) -> str:
-    return f"{BASE_URL}/our-courts/supreme-court/orders-and-opinions/opinions/{year}"
+    return f"{BASE_URL}/our-courts/supreme-court/orders-and-opinions/case-orders/{year}"
 
 
 def ensure_dirs() -> None:
@@ -70,7 +70,7 @@ def setup_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    log_name = f"nh_supreme_court_opinions-{datetime.now().strftime('%Y-%m-%d')}.log"
+    log_name = f"nh_case_orders_opinions-{datetime.now().strftime('%Y-%m-%d')}.log"
     log_path = LOG_DIR / log_name
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
