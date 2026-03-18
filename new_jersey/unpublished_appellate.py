@@ -38,11 +38,26 @@ from bs4 import BeautifulSoup
 START_URL = "https://www.njcourts.gov/attorneys/opinions/unpublished-appellate"
 BASE = "https://www.njcourts.gov"
 
-COURT_FOLDER = "unpublished_appellate"
+COURT_FOLDER = "Unpublished Appellate"
 
 BASE_DIR = os.path.join("downloads", COURT_FOLDER)
 CSV_DIR = os.path.join(BASE_DIR, "CSV")
 CSV_PATH = os.path.join(CSV_DIR, "unpublished_appellate.csv")
+COMBINED_CSV_DIR = os.path.join("downloads", "CSV")
+COMBINED_CSV_PATH = os.path.join(COMBINED_CSV_DIR, "case.csv")
+COMBINED_FIELDNAMES = [
+    "source_court",
+    "date",
+    "no",
+    "court",
+    "case_name",
+    "description",
+    "page_url",
+    "pdf_url",
+    "pdf_file",
+    "pdf_full_path",
+    "download_status",
+]
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36"
 PAGE_DELAY_SEC = 0.35
@@ -55,6 +70,7 @@ MAX_FILENAME_LEN = 150
 def ensure_dirs():
     os.makedirs(BASE_DIR, exist_ok=True)
     os.makedirs(CSV_DIR, exist_ok=True)
+    os.makedirs(COMBINED_CSV_DIR, exist_ok=True)
 
 
 def clean_ws(s: str) -> str:
@@ -227,6 +243,19 @@ def load_existing_pdf_urls(csv_path: str):
     return existing
 
 
+def build_combined_dedupe_key(row: dict):
+    pdf_url = clean_ws(row.get("pdf_url", ""))
+    if pdf_url:
+        return ("pdf", pdf_url)
+    return (
+        "meta",
+        clean_ws(row.get("date", "")),
+        clean_ws(row.get("no", "")),
+        clean_ws(row.get("court", "")),
+        clean_ws(row.get("case_name", "")),
+    )
+
+
 def main():
     ensure_dirs()
 
@@ -234,6 +263,14 @@ def main():
     session.headers.update({"User-Agent": UA})
 
     existing_pdf_urls = load_existing_pdf_urls(CSV_PATH)
+    existing_combined_keys = set()
+    if os.path.exists(COMBINED_CSV_PATH) and os.path.getsize(COMBINED_CSV_PATH) > 0:
+        try:
+            with open(COMBINED_CSV_PATH, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    existing_combined_keys.add(build_combined_dedupe_key(row))
+        except Exception as e:
+            print(f"⚠️ Failed to read combined CSV for dedupe: {e}")
 
     file_exists = os.path.exists(CSV_PATH) and os.path.getsize(CSV_PATH) > 0
     csv_f = open(CSV_PATH, "a", newline="", encoding="utf-8")
@@ -255,6 +292,13 @@ def main():
     if not file_exists:
         writer.writeheader()
         csv_f.flush()
+
+    combined_exists = os.path.exists(COMBINED_CSV_PATH) and os.path.getsize(COMBINED_CSV_PATH) > 0
+    combined_f = open(COMBINED_CSV_PATH, "a", newline="", encoding="utf-8")
+    combined_writer = csv.DictWriter(combined_f, fieldnames=COMBINED_FIELDNAMES)
+    if not combined_exists:
+        combined_writer.writeheader()
+        combined_f.flush()
 
     url = START_URL
     visited = set()
@@ -300,6 +344,25 @@ def main():
             writer.writerow({**r, "download_status": status})
             csv_f.flush()
 
+            combined_row = {
+                "source_court": COURT_FOLDER,
+                "date": r.get("date", ""),
+                "no": r.get("no", ""),
+                "court": r.get("court", ""),
+                "case_name": r.get("case_name", ""),
+                "description": "",
+                "page_url": r.get("page_url", ""),
+                "pdf_url": r.get("pdf_url", ""),
+                "pdf_file": r.get("pdf_file", ""),
+                "pdf_full_path": r.get("pdf_full_path", ""),
+                "download_status": status,
+            }
+            combined_key = build_combined_dedupe_key(combined_row)
+            if combined_key not in existing_combined_keys:
+                combined_writer.writerow(combined_row)
+                combined_f.flush()
+                existing_combined_keys.add(combined_key)
+
             if pdf_url:
                 existing_pdf_urls.add(pdf_url)
 
@@ -319,9 +382,11 @@ def main():
         time.sleep(PAGE_DELAY_SEC)
 
     csv_f.close()
+    combined_f.close()
 
     print("\n✅ DONE")
     print(f"CSV : {CSV_PATH}")
+    print(f"Combined CSV: {COMBINED_CSV_PATH}")
     print(f"Base folder: {BASE_DIR}")
     print(f"Pages scraped: {page_count}")
     print(f"Items found: {item_count}")
