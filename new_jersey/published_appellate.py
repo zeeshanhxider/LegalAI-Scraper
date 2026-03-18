@@ -66,6 +66,8 @@ PAGE_DELAY_SEC = 0.35
 MAX_PAGES = None   # set to 2 for testing
 MAX_ITEMS = None   # set to 50 for testing
 MAX_FILENAME_LEN = 150
+MAX_FOLDER_LEN = 90
+WINDOWS_MAX_PATH = 240
 
 
 def ensure_dirs():
@@ -98,12 +100,22 @@ def safe_filename(name: str, default="file", max_len: int = MAX_FILENAME_LEN) ->
     return f"{base[:keep]}{suffix}"
 
 
-def safe_folder_name(name: str, default="unknown") -> str:
+def safe_folder_name(name: str, default="unknown", max_len: int = MAX_FOLDER_LEN) -> str:
     name = clean_ws(name)
     name = re.sub(r'[<>:"\\|?*]+', "_", name)
     name = name.replace("/", "_").replace("\\", "_")
     name = name.strip("._ ")
-    return name if name else default
+    if not name:
+        return default
+
+    if len(name) <= max_len:
+        return name
+
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+    keep = max_len - len(digest) - 1
+    if keep <= 0:
+        return digest[:max_len]
+    return f"{name[:keep]}_{digest}"
 
 
 def extract_year(date_text: str) -> str:
@@ -117,6 +129,55 @@ def extract_year(date_text: str) -> str:
     return "unknown_year"
 
 
+def build_pdf_path(year: str, docket_no: str, pdf_file: str) -> str:
+    def win_path_len(path: str) -> int:
+        return len(os.path.normpath(os.path.abspath(path)))
+
+    docket_folder = safe_folder_name(docket_no if docket_no else "unknown_no")
+    file_name = safe_filename(pdf_file, default="opinion.pdf", max_len=MAX_FILENAME_LEN)
+    if not file_name.lower().endswith(".pdf"):
+        file_name += ".pdf"
+
+    candidate = os.path.normpath(os.path.join(BASE_DIR, year, docket_folder, file_name))
+    if os.name != "nt" or win_path_len(candidate) <= WINDOWS_MAX_PATH:
+        return candidate
+
+    # On Windows, reduce filename first, then folder name, to stay under MAX_PATH.
+    year_dir = os.path.normpath(os.path.abspath(os.path.join(BASE_DIR, year)))
+    max_file_len = WINDOWS_MAX_PATH - len(year_dir) - 3
+    max_file_len = max(24, min(MAX_FILENAME_LEN, max_file_len))
+    file_name = safe_filename(file_name, default="opinion.pdf", max_len=max_file_len)
+    if not file_name.lower().endswith(".pdf"):
+        file_name += ".pdf"
+
+    candidate = os.path.normpath(os.path.join(BASE_DIR, year, docket_folder, file_name))
+    if win_path_len(candidate) <= WINDOWS_MAX_PATH:
+        return candidate
+
+    max_folder_len = WINDOWS_MAX_PATH - len(year_dir) - len(file_name) - 2
+    max_folder_len = max(16, min(MAX_FOLDER_LEN, max_folder_len))
+    docket_folder = safe_folder_name(docket_folder, default="unknown_no", max_len=max_folder_len)
+
+    candidate = os.path.normpath(os.path.join(BASE_DIR, year, docket_folder, file_name))
+    if win_path_len(candidate) <= WINDOWS_MAX_PATH:
+        return candidate
+
+    digest = hashlib.sha1(f"{docket_no}|{file_name}".encode("utf-8")).hexdigest()[:12]
+    docket_folder = f"case_{digest}"
+    file_name = safe_filename(file_name, default=f"{digest}.pdf", max_len=60)
+    if not file_name.lower().endswith(".pdf"):
+        file_name += ".pdf"
+    candidate = os.path.normpath(os.path.join(BASE_DIR, year, docket_folder, file_name))
+    if win_path_len(candidate) <= WINDOWS_MAX_PATH:
+        return candidate
+
+    candidate = os.path.normpath(os.path.join(BASE_DIR, year, f"{digest}.pdf"))
+    if win_path_len(candidate) <= WINDOWS_MAX_PATH:
+        return candidate
+
+    return os.path.normpath(os.path.join(BASE_DIR, f"{digest}.pdf"))
+
+
 def get_html(session: requests.Session, url: str, timeout=60) -> str:
     r = session.get(url, timeout=timeout)
     r.raise_for_status()
@@ -127,7 +188,13 @@ def download_file(session: requests.Session, url: str, out_path: str, timeout=12
     if not url:
         return False
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    parent_dir = os.path.dirname(out_path)
+    if parent_dir:
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+        except OSError as e:
+            print(f"   ⚠️ Cannot create folder for PDF: {parent_dir} -> {e}")
+            return False
 
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return True
@@ -218,9 +285,8 @@ def parse_cards(soup: BeautifulSoup, page_url: str):
             if not pdf_file.lower().endswith(".pdf"):
                 pdf_file += ".pdf"
 
-            docket_folder = safe_folder_name(no if no else "unknown_no")
-            pdf_dir = os.path.join(BASE_DIR, year, docket_folder)
-            pdf_full_path = os.path.join(pdf_dir, pdf_file)
+            pdf_full_path = build_pdf_path(year, no, pdf_file)
+            pdf_file = os.path.basename(pdf_full_path)
 
         rows.append({
             "date": date,

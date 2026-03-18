@@ -14,7 +14,8 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 START_URL = "https://www.pacourts.us/site-search?c=Opinions&q=#sort=relevancy&f:@filetype=[pdf]"
 DOWNLOAD_DIR = "downloads"
 DEBUG_DIR = "debug"
-OUT_CSV = "pacourts_pdfs.csv"
+ALL_CSV_DIR = "CSV"
+ALL_CSV_FILE = "all_courts.csv"
 HEADLESS = os.getenv("HEADLESS", "1") != "0"
 WAIT_TIMEOUT_MS = int(os.getenv("WAIT_TIMEOUT_MS", "60000"))
 DUMP_SKIPS = int(os.getenv("DUMP_SKIPS", "1"))
@@ -193,6 +194,22 @@ def build_pdf_filename(title: str, pdf_url: str) -> str:
     if url_name.lower().endswith(".pdf") and len(url_name) > 4:
         return f"{base}__{url_name}"
     return f"{base}.pdf"
+
+
+def extract_year_from_date(date_text: str) -> str:
+    match = re.search(r"(19|20)\d{2}", date_text or "")
+    return match.group(0) if match else "unknown_year"
+
+
+def normalize_court_name(source: str, publication: str = "") -> str:
+    court = clean_text(source) or clean_text(publication) or "unknown_court"
+    return safe_filename(court, max_len=100) or "unknown_court"
+
+
+def build_pdf_output_path(base_dir: str, court: str, year: str, title: str, pdf_url: str) -> str:
+    title_dir = safe_filename(title, max_len=100) or "untitled"
+    pdf_file_name = build_pdf_filename(title, pdf_url)
+    return os.path.join(base_dir, court, year, title_dir, pdf_file_name)
 
 
 async def click_and_capture_pdf(page, title_locator) -> str:
@@ -431,9 +448,9 @@ async def extract_pdf_url_from_result(result, base_url: str) -> str:
             if not isinstance(payload, dict):
                 continue
             for key in ("clickUri", "uri", "rawUri", "printableUri"):
-            url = normalize_candidate_url(payload.get(key, ""), base_url)
-            if url:
-                return url
+                url = normalize_candidate_url(payload.get(key, ""), base_url)
+                if url:
+                    return url
             raw = payload.get("raw", {}) or {}
             for key in ("uri", "clickuri", "fileuri", "fileurl"):
                 url = normalize_candidate_url(raw.get(key, ""), base_url)
@@ -577,10 +594,30 @@ async def main():
             await browser.close()
             return
 
-        with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-            writer.writeheader()
+        court_csv_files = {}
+        all_csv_dir = os.path.join(DOWNLOAD_DIR, ALL_CSV_DIR)
+        os.makedirs(all_csv_dir, exist_ok=True)
+        all_csv_path = os.path.join(all_csv_dir, ALL_CSV_FILE)
+        all_csv_exists = os.path.exists(all_csv_path) and os.path.getsize(all_csv_path) > 0
+        all_csv_file = open(all_csv_path, "a", newline="", encoding="utf-8")
+        all_csv_writer = csv.DictWriter(all_csv_file, fieldnames=CSV_FIELDS)
+        if not all_csv_exists:
+            all_csv_writer.writeheader()
 
+        def get_court_csv(court: str):
+            if court not in court_csv_files:
+                court_dir = os.path.join(DOWNLOAD_DIR, court)
+                os.makedirs(court_dir, exist_ok=True)
+                csv_path = os.path.join(court_dir, f"{court}.csv")
+                csv_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+                csv_file = open(csv_path, "a", newline="", encoding="utf-8")
+                writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
+                if not csv_exists:
+                    writer.writeheader()
+                court_csv_files[court] = {"file": csv_file, "writer": writer, "path": csv_path}
+            return court_csv_files[court]
+
+        try:
             page_no = 1
             total_written = 0
 
@@ -621,6 +658,9 @@ async def main():
                         r.locator('span.CoveoFieldValue[data-field="@syspages"] span:last-child')
                     )
 
+                    court_name = normalize_court_name(source, publication)
+                    year = extract_year_from_date(date)
+
                     pdf_url = await extract_pdf_url_from_result(r, page.url)
                     if not pdf_url:
                         # Fallback: capture by listening to network responses on click
@@ -633,11 +673,13 @@ async def main():
                             dumped += 1
                         continue
 
-                    pdf_file_name = build_pdf_filename(title, pdf_url)
-                    pdf_path = os.path.join(DOWNLOAD_DIR, pdf_file_name)
+                    pdf_path = build_pdf_output_path(
+                        DOWNLOAD_DIR, court_name, year, title, pdf_url
+                    )
+                    os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
 
                     if not os.path.exists(pdf_path):
-                        print(f"  - Queue download: {pdf_file_name}")
+                        print(f"  - Queue download: {pdf_path}")
                         task = asyncio.create_task(
                             download_pdf_async(pdf_url, pdf_path, page.url, download_sem)
                         )
@@ -645,10 +687,9 @@ async def main():
                         if len(download_tasks) > MAX_DOWNLOAD_QUEUE:
                             await drain_downloads(download_tasks, keep=MAX_DOWNLOADS)
                     else:
-                        print(f"  - Already downloaded: {pdf_file_name}")
+                        print(f"  - Already downloaded: {pdf_path}")
 
-                    # Write CSV row-by-row (one by one)
-                    writer.writerow({
+                    row = {
                         "title": title,
                         "date": date,
                         "excerpt": excerpt,
@@ -658,7 +699,13 @@ async def main():
                         "pages": pages,
                         "pdf_url": pdf_url,
                         "pdf_file": pdf_path,
-                    })
+                    }
+
+                    court_csv = get_court_csv(court_name)
+                    court_csv["writer"].writerow(row)
+                    court_csv["file"].flush()
+                    all_csv_writer.writerow(row)
+                    all_csv_file.flush()
                     total_written += 1
 
                 print(f"Written total: {total_written}")
@@ -691,13 +738,19 @@ async def main():
                 )
 
                 page_no += 1
+        finally:
+            for entry in court_csv_files.values():
+                with suppress(Exception):
+                    entry["file"].close()
+            with suppress(Exception):
+                all_csv_file.close()
 
         await finalize_downloads(download_tasks)
         await browser.close()
 
     print("\n✅ Done!")
-    print(f"CSV saved: {OUT_CSV}")
-    print(f"PDF folder: {DOWNLOAD_DIR}/")
+    print(f"PDF/CSV root folder: {DOWNLOAD_DIR}/")
+    print(f"All courts CSV: {all_csv_path}")
 
 
 if __name__ == "__main__":
