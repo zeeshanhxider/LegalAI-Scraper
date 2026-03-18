@@ -18,6 +18,8 @@ URL = (
 )
 
 OUT_DIR = "downloads"
+COMBINED_CSV_DIR = os.path.join(OUT_DIR, "CSV")
+COMBINED_CSV_PATH = os.path.join(COMBINED_CSV_DIR, "case.csv")
 
 HEADERS = {
     "User-Agent": (
@@ -37,6 +39,30 @@ NEXT_BTN_SEL = "#pagination-next-page"
 
 def ensure_dirs():
     os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(COMBINED_CSV_DIR, exist_ok=True)
+
+
+def load_existing_combined_keys():
+    keys = set()
+    if not os.path.exists(COMBINED_CSV_PATH) or os.path.getsize(COMBINED_CSV_PATH) == 0:
+        return keys
+
+    try:
+        with open(COMBINED_CSV_PATH, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = (
+                    (row.get("release_date") or "").strip(),
+                    (row.get("court") or "").strip(),
+                    (row.get("case_no") or "").strip(),
+                    (row.get("pdf_url") or "").strip(),
+                )
+                if any(key):
+                    keys.add(key)
+    except Exception:
+        return keys
+
+    return keys
 
 
 def safe_filename(name: str, max_len: int = 180) -> str:
@@ -270,6 +296,13 @@ async def main():
         court_csv_files = {}
         court_csv_writers = {}
         court_csv_paths = {}
+        combined_keys = load_existing_combined_keys()
+        combined_mode = "a" if os.path.exists(COMBINED_CSV_PATH) and os.path.getsize(COMBINED_CSV_PATH) > 0 else "w"
+        combined_csv_file = open(COMBINED_CSV_PATH, combined_mode, newline="", encoding="utf-8")
+        combined_csv_writer = csv.DictWriter(combined_csv_file, fieldnames=fieldnames)
+        if combined_mode == "w":
+            combined_csv_writer.writeheader()
+            combined_csv_file.flush()
 
         try:
             while True:
@@ -330,6 +363,10 @@ async def main():
                     csv_file = court_csv_files[court_dir]
                     writer.writerow(out_row)
                     csv_file.flush()
+                    if key not in combined_keys:
+                        combined_csv_writer.writerow(out_row)
+                        combined_csv_file.flush()
+                        combined_keys.add(key)
                     total_written += 1
 
                     print(
@@ -353,6 +390,7 @@ async def main():
         finally:
             for csv_file in court_csv_files.values():
                 csv_file.close()
+            combined_csv_file.close()
 
         await browser.close()
 
@@ -360,6 +398,7 @@ async def main():
         print("Base folder:", OUT_DIR)
         for court_dir, csv_path in sorted(court_csv_paths.items()):
             print(f"CSV ({court_dir}):", csv_path)
+        print("CSV (all courts):", COMBINED_CSV_PATH)
         print("Total rows:", total_written)
 
 

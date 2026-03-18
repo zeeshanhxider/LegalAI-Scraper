@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import requests
 from selenium import webdriver
@@ -40,6 +40,20 @@ CSV_COLUMNS = [
     "pdf_url",
     "pdf_local_path",
 ]
+COMBINED_COLUMNS = [
+    "source_type",
+    "advance_no",
+    "case_number",
+    "case_title",
+    "opinion_filed_on",
+    "opinion_date",
+    "order_date",
+    "docket_url",
+    "pdf_url",
+    "pdf_local_path",
+]
+SOURCE_TYPE = "unpublished_orders"
+COMBINED_CSV_PATH = DOWNLOADS_ROOT / "CSV" / "case.csv"
 
 
 def setup_logger() -> logging.Logger:
@@ -169,6 +183,7 @@ def make_driver(headless: bool) -> webdriver.Chrome:
 
 def ensure_outputs(logger: logging.Logger):
     CSV_DIR.mkdir(parents=True, exist_ok=True)
+    COMBINED_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     BASE_DOWNLOAD.mkdir(parents=True, exist_ok=True)
     if not CSV_PATH.exists():
         with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
@@ -177,6 +192,12 @@ def ensure_outputs(logger: logging.Logger):
         logger.info(f"Created CSV: {CSV_PATH.resolve()}")
     else:
         logger.info(f"Using existing CSV: {CSV_PATH.resolve()}")
+
+    if not COMBINED_CSV_PATH.exists():
+        with COMBINED_CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=COMBINED_COLUMNS)
+            w.writeheader()
+        logger.info(f"Created combined CSV: {COMBINED_CSV_PATH.resolve()}")
 
 
 def load_existing_keys() -> set:
@@ -196,6 +217,82 @@ def load_existing_keys() -> set:
             if key_id and od:
                 keys.add((key_id, od))
     return keys
+
+
+def build_combined_key(case_number: str, case_title: str, order_date: str) -> Tuple[str, str]:
+    key_id = normalize_text(case_number) or normalize_text(case_title)
+    return key_id, normalize_text(order_date)
+
+
+def load_existing_combined_keys() -> Set[Tuple[str, str]]:
+    keys: Set[Tuple[str, str]] = set()
+    if not COMBINED_CSV_PATH.exists() or COMBINED_CSV_PATH.stat().st_size == 0:
+        return keys
+
+    with COMBINED_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            source = normalize_text(row.get("source_type", ""))
+            if source and source != SOURCE_TYPE:
+                continue
+
+            key = build_combined_key(
+                row.get("case_number", ""),
+                row.get("case_title", ""),
+                row.get("order_date", ""),
+            )
+            if key[0] and key[1]:
+                keys.add(key)
+    return keys
+
+
+def build_combined_row(row: Dict[str, str]) -> Dict[str, str]:
+    return {
+        "source_type": SOURCE_TYPE,
+        "advance_no": "",
+        "case_number": row.get("case_number", ""),
+        "case_title": row.get("case_title", ""),
+        "opinion_filed_on": "",
+        "opinion_date": "",
+        "order_date": row.get("order_date", ""),
+        "docket_url": row.get("docket_url", ""),
+        "pdf_url": row.get("pdf_url", ""),
+        "pdf_local_path": row.get("pdf_local_path", ""),
+    }
+
+
+def append_combined_row(row: Dict[str, str]):
+    with COMBINED_CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=COMBINED_COLUMNS)
+        w.writerow(build_combined_row(row))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def sync_existing_csv_to_combined(logger: logging.Logger, combined_keys: Set[Tuple[str, str]]) -> int:
+    if not CSV_PATH.exists() or CSV_PATH.stat().st_size == 0:
+        return 0
+
+    backfilled = 0
+    with CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            row = {k: normalize_text(v or "") for k, v in row.items()}
+            key = build_combined_key(
+                row.get("case_number", ""),
+                row.get("case_title", ""),
+                row.get("order_date", ""),
+            )
+            if not key[0] or not key[1] or key in combined_keys:
+                continue
+
+            append_combined_row(row)
+            combined_keys.add(key)
+            backfilled += 1
+
+    if backfilled:
+        logger.info(f"Backfilled {backfilled} unpublished order rows into combined CSV")
+    return backfilled
 
 
 def selenium_cookies_to_requests_session(driver: webdriver.Chrome) -> requests.Session:
@@ -283,6 +380,8 @@ def scrape(headless: bool, download: bool, limit: int):
 
     ensure_outputs(logger)
     existing_keys = load_existing_keys()
+    combined_keys = load_existing_combined_keys()
+    sync_existing_csv_to_combined(logger, combined_keys)
 
     driver = make_driver(headless=headless)
     added = 0
@@ -359,6 +458,10 @@ def scrape(headless: bool, download: bool, limit: int):
 
             # Save one-by-one immediately
             append_row_one_by_one(row)
+            combined_key = build_combined_key(case_number, case_title, order_date)
+            if combined_key not in combined_keys:
+                append_combined_row(row)
+                combined_keys.add(combined_key)
             existing_keys.add(key)
             added += 1
 

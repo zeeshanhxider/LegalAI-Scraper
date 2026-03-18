@@ -7,6 +7,7 @@ URL: https://www.nccourts.gov/documents/appellate-court-opinions
 
 Outputs:
 - CSV: downloads/<court_name>/nc_appellate_opinions.csv
+- Merged CSV: downloads/CSV/north_carolina_opinions_merged.csv
 - Files (pdf/zip): downloads/<court_name>/<year>/<case_name>/
 
 Features:
@@ -32,6 +33,8 @@ BASE_URL = "https://www.nccourts.gov/documents/appellate-court-opinions"
 
 DOWNLOADS_DIR = "downloads"
 CSV_FILENAME = "nc_appellate_opinions.csv"
+MERGED_CSV_DIR = os.path.join(DOWNLOADS_DIR, "CSV")
+MERGED_CSV_PATH = os.path.join(MERGED_CSV_DIR, "north_carolina_opinions_merged.csv")
 CSV_FIELDS = [
     "date",
     "court",
@@ -75,6 +78,7 @@ class Row:
 
 def ensure_dirs():
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+    os.makedirs(MERGED_CSV_DIR, exist_ok=True)
 
 
 def clean_ws(s: str) -> str:
@@ -247,6 +251,14 @@ def main():
     csv_writers = {}
     csv_files = {}
 
+    # Shared merged CSV: downloads/CSV/north_carolina_opinions_merged.csv
+    merged_exists = os.path.exists(MERGED_CSV_PATH) and os.path.getsize(MERGED_CSV_PATH) > 0
+    merged_csv_f = open(MERGED_CSV_PATH, "a", newline="", encoding="utf-8")
+    merged_writer = csv.DictWriter(merged_csv_f, fieldnames=CSV_FIELDS)
+    if not merged_exists:
+        merged_writer.writeheader()
+        merged_csv_f.flush()
+
     count_items = 0
     count_pages = 0
 
@@ -323,23 +335,24 @@ def main():
 
             # Write streaming CSV row in the corresponding court folder
             writer, csv_f, _ = get_csv_writer(row.court, csv_writers, csv_files)
-            writer.writerow(
-                {
-                    "date": row.date,
-                    "court": row.court,
-                    "status": row.status,
-                    "docket": row.docket,
-                    "case_name": row.case_name,
-                    "description": row.description,
-                    "page_url": row.page_url,
-                    "pdf_url": row.pdf_url,
-                    "zip_url": row.zip_url,
-                    "downloaded_pdf": row.downloaded_pdf,
-                    "downloaded_zip": row.downloaded_zip,
-                    "download_status": row.download_status,
-                }
-            )
+            row_data = {
+                "date": row.date,
+                "court": row.court,
+                "status": row.status,
+                "docket": row.docket,
+                "case_name": row.case_name,
+                "description": row.description,
+                "page_url": row.page_url,
+                "pdf_url": row.pdf_url,
+                "zip_url": row.zip_url,
+                "downloaded_pdf": row.downloaded_pdf,
+                "downloaded_zip": row.downloaded_zip,
+                "download_status": row.download_status,
+            }
+            writer.writerow(row_data)
             csv_f.flush()
+            merged_writer.writerow(row_data)
+            merged_csv_f.flush()
 
             count_items += 1
             if MAX_ITEMS is not None and count_items >= MAX_ITEMS:
@@ -358,9 +371,11 @@ def main():
 
     for csv_f in csv_files.values():
         csv_f.close()
+    merged_csv_f.close()
 
     print("\n✅ Done")
     print(f"Download root: {DOWNLOADS_DIR}")
+    print(f"Merged CSV: {MERGED_CSV_PATH}")
     print(f"CSV files written: {len(csv_files)}")
     for csv_path in sorted(csv_files):
         print(f" - {csv_path}")

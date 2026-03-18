@@ -7,6 +7,7 @@ URL: https://www.nccourts.gov/documents/business-court-opinions
 
 Outputs:
 - CSV : downloads/Business Court/business_court_opinions.csv
+- Merged CSV: downloads/CSV/north_carolina_opinions_merged.csv
 - PDFs: downloads/Business Court/<year>/<case_name>/<pdf-file>
 
 Notes:
@@ -34,6 +35,22 @@ COURT_NAME = "Business Court"
 
 OUT_ROOT = os.path.join("downloads", COURT_NAME)
 CSV_PATH = os.path.join(OUT_ROOT, "business_court_opinions.csv")
+MERGED_CSV_DIR = os.path.join("downloads", "CSV")
+MERGED_CSV_PATH = os.path.join(MERGED_CSV_DIR, "north_carolina_opinions_merged.csv")
+CSV_FIELDS = [
+    "date",
+    "court",
+    "status",
+    "docket",
+    "case_name",
+    "description",
+    "page_url",
+    "pdf_url",
+    "zip_url",
+    "downloaded_pdf",
+    "downloaded_zip",
+    "download_status",
+]
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36"
 
@@ -62,6 +79,7 @@ class Row:
 
 def ensure_dirs():
     os.makedirs(OUT_ROOT, exist_ok=True)
+    os.makedirs(MERGED_CSV_DIR, exist_ok=True)
 
 
 def clean_ws(s: str) -> str:
@@ -253,24 +271,19 @@ def main():
     csv_f = open(CSV_PATH, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(
         csv_f,
-        fieldnames=[
-            "date",
-            "court",
-            "status",
-            "docket",
-            "case_name",
-            "description",
-            "page_url",
-            "pdf_url",
-            "zip_url",
-            "downloaded_pdf",
-            "downloaded_zip",
-            "download_status",
-        ],
+        fieldnames=CSV_FIELDS,
     )
     if not file_exists:
         writer.writeheader()
         csv_f.flush()
+
+    # Shared merged CSV: downloads/CSV/north_carolina_opinions_merged.csv
+    merged_exists = os.path.exists(MERGED_CSV_PATH) and os.path.getsize(MERGED_CSV_PATH) > 0
+    merged_csv_f = open(MERGED_CSV_PATH, "a", newline="", encoding="utf-8")
+    merged_writer = csv.DictWriter(merged_csv_f, fieldnames=CSV_FIELDS)
+    if not merged_exists:
+        merged_writer.writeheader()
+        merged_csv_f.flush()
 
     url = BASE_URL
     visited = set()
@@ -371,23 +384,24 @@ def main():
             row.download_status = "|".join(status_parts) if status_parts else "no-file"
 
             # Write one-by-one
-            writer.writerow(
-                {
-                    "date": row.date,
-                    "court": row.court,
-                    "status": row.status,
-                    "docket": row.docket,
-                    "case_name": row.case_name,
-                    "description": row.description,
-                    "page_url": row.page_url,
-                    "pdf_url": row.pdf_url,
-                    "zip_url": row.zip_url,
-                    "downloaded_pdf": row.downloaded_pdf,
-                    "downloaded_zip": row.downloaded_zip,
-                    "download_status": row.download_status,
-                }
-            )
+            row_data = {
+                "date": row.date,
+                "court": row.court,
+                "status": row.status,
+                "docket": row.docket,
+                "case_name": row.case_name,
+                "description": row.description,
+                "page_url": row.page_url,
+                "pdf_url": row.pdf_url,
+                "zip_url": row.zip_url,
+                "downloaded_pdf": row.downloaded_pdf,
+                "downloaded_zip": row.downloaded_zip,
+                "download_status": row.download_status,
+            }
+            writer.writerow(row_data)
             csv_f.flush()
+            merged_writer.writerow(row_data)
+            merged_csv_f.flush()
 
             rows += 1
             if MAX_ITEMS is not None and rows >= MAX_ITEMS:
@@ -404,8 +418,10 @@ def main():
         time.sleep(PAGE_DELAY_SEC)
 
     csv_f.close()
+    merged_csv_f.close()
     print("\n✅ Done")
     print(f"CSV  : {CSV_PATH}")
+    print(f"Merged CSV: {MERGED_CSV_PATH}")
     print(f"PDFs : {OUT_ROOT}/<year>/<case_name>/")
     print(f"Pages: {pages}")
     print(f"Rows : {rows}")

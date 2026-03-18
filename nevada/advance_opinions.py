@@ -54,9 +54,23 @@ EXPECTED_COLUMNS = [
     "pdf_url",
     "pdf_local_path",
 ]
+COMBINED_COLUMNS = [
+    "source_type",
+    "advance_no",
+    "case_number",
+    "case_title",
+    "opinion_filed_on",
+    "opinion_date",
+    "order_date",
+    "docket_url",
+    "pdf_url",
+    "pdf_local_path",
+]
+SOURCE_TYPE = "advance_opinions"
 
 BASE_DIR = Path(__file__).resolve().parent
 CSV_PATH = BASE_DIR / "downloads" / "supreme_court" / "advance_opinions" / "CSV" / "case.csv"
+COMBINED_CSV_PATH = BASE_DIR / "downloads" / "CSV" / "case.csv"
 DOWNLOADS_ROOT = BASE_DIR / "downloads"
 COURT_PATH = Path("supreme_court") / "advance_opinions"
 PDF_COURT_DIR = DOWNLOADS_ROOT / COURT_PATH
@@ -140,6 +154,7 @@ def build_pdf_path(advance_no: str, case_number: str, case_title: str, opinion_f
 
 def ensure_output_dirs() -> None:
     CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    COMBINED_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     PDF_COURT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -237,6 +252,103 @@ def append_csv_row(record: Dict[str, str], csv_header: Sequence[str]) -> None:
     with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([record.get(col, "") for col in csv_header])
+
+
+def ensure_combined_csv_file(logger: logging.Logger) -> None:
+    if COMBINED_CSV_PATH.exists() and COMBINED_CSV_PATH.stat().st_size > 0:
+        return
+
+    with COMBINED_CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(COMBINED_COLUMNS)
+    logger.info("Created combined CSV: %s", COMBINED_CSV_PATH.resolve())
+
+
+def load_existing_combined_keys() -> Set[Tuple[str, str]]:
+    keys: Set[Tuple[str, str]] = set()
+    if not COMBINED_CSV_PATH.exists() or COMBINED_CSV_PATH.stat().st_size == 0:
+        return keys
+
+    with COMBINED_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            source = normalize_text(row.get("source_type", ""))
+            if source and source != SOURCE_TYPE:
+                continue
+
+            key = build_record_key(
+                row.get("advance_no", ""),
+                row.get("case_number", ""),
+                row.get("case_title", ""),
+            )
+            if key[0] and key[1]:
+                keys.add(key)
+    return keys
+
+
+def append_combined_csv_row(record: Dict[str, str]) -> None:
+    with COMBINED_CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([record.get(col, "") for col in COMBINED_COLUMNS])
+
+
+def build_combined_record(record: Dict[str, str]) -> Dict[str, str]:
+    return {
+        "source_type": SOURCE_TYPE,
+        "advance_no": record.get("advance_no", ""),
+        "case_number": record.get("case_number", ""),
+        "case_title": record.get("case_title", ""),
+        "opinion_filed_on": record.get("opinion_filed_on", ""),
+        "opinion_date": record.get(DATE_COLUMN, ""),
+        "order_date": "",
+        "docket_url": record.get("docket_url", ""),
+        "pdf_url": record.get("pdf_url", ""),
+        "pdf_local_path": record.get("pdf_local_path", ""),
+    }
+
+
+def sync_existing_csv_to_combined(
+    logger: logging.Logger,
+    combined_keys: Set[Tuple[str, str]],
+) -> int:
+    if not CSV_PATH.exists() or CSV_PATH.stat().st_size == 0:
+        return 0
+
+    backfilled = 0
+    with CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = build_record_key(
+                row.get("advance_no", ""),
+                row.get("case_number", ""),
+                row.get("case_title", ""),
+            )
+            if not key[0] or not key[1] or key in combined_keys:
+                continue
+
+            opinion_filed_on = normalize_text(row.get("opinion_filed_on", ""))
+            opinion_date = normalize_text(row.get(DATE_COLUMN, ""))
+            if not opinion_date:
+                opinion_date = extract_opinion_date(opinion_filed_on)
+
+            record = {
+                "advance_no": normalize_text(row.get("advance_no", "")),
+                "case_number": normalize_text(row.get("case_number", "")),
+                "case_title": normalize_text(row.get("case_title", "")),
+                "opinion_filed_on": opinion_filed_on,
+                DATE_COLUMN: opinion_date,
+                "docket_url": normalize_text(row.get("docket_url", "")),
+                "pdf_url": normalize_text(row.get("pdf_url", "")),
+                "pdf_local_path": normalize_text(row.get("pdf_local_path", "")),
+            }
+
+            append_combined_csv_row(build_combined_record(record))
+            combined_keys.add(key)
+            backfilled += 1
+
+    if backfilled:
+        logger.info("Backfilled %s advance opinion rows into combined CSV", backfilled)
+    return backfilled
 
 
 def parse_requesturl_onclick(onclick: str) -> Tuple[str, str]:
@@ -538,7 +650,10 @@ def scrape(args: argparse.Namespace) -> int:
         logger.info("Limit: %s", args.limit)
 
     csv_header = ensure_csv_file(logger)
+    ensure_combined_csv_file(logger)
     existing_keys = load_existing_keys()
+    combined_keys = load_existing_combined_keys()
+    sync_existing_csv_to_combined(logger, combined_keys)
     existing_pdfs: Set[str] = {str(p.resolve()) for p in PDF_COURT_DIR.rglob("*.pdf")}
 
     driver: Optional[webdriver.Chrome] = None
@@ -628,6 +743,9 @@ def scrape(args: argparse.Namespace) -> int:
                     "pdf_local_path": pdf_local_path,
                 }
                 append_csv_row(record, csv_header)
+                if key not in combined_keys:
+                    append_combined_csv_row(build_combined_record(record))
+                    combined_keys.add(key)
                 existing_keys.add(key)
                 added += 1
 
