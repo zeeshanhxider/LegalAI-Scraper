@@ -40,11 +40,13 @@ CSV_COLUMNS = [
 ]
 
 ROOT_DIR = Path(__file__).resolve().parent
-DOWNLOADS_DIR = ROOT_DIR / "downloads/supervisory_orders"
-CSV_DIR = DOWNLOADS_DIR / "CSV"
-PDF_DIR = DOWNLOADS_DIR / "PDF"
+DOWNLOADS_DIR = ROOT_DIR / "downloads"
+COURT_NAME = "supreme_court/supervisory-orders"
+COURT_DIR = DOWNLOADS_DIR / COURT_NAME
+CSV_DIR = COURT_DIR / "CSV"
+TEMP_PDF_DIR = COURT_DIR / "_temp_downloads"
 LOG_DIR = ROOT_DIR / "Log"
-CSV_PATH = CSV_DIR / "nh_supervisory_orders.csv"
+CSV_PATH = CSV_DIR / "nh_supreme_court_supervisory_orders.csv"
 
 DESKTOP_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -59,18 +61,18 @@ def build_year_url(year: int) -> str:
 
 def ensure_dirs() -> None:
     CSV_DIR.mkdir(parents=True, exist_ok=True)
-    PDF_DIR.mkdir(parents=True, exist_ok=True)
+    TEMP_PDF_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logger() -> logging.Logger:
     ensure_dirs()
 
-    logger = logging.getLogger("nh_opinions_scraper")
+    logger = logging.getLogger("nh_supervisory_orders_scraper")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    log_name = f"nh_supervisory_orders_opinions-{datetime.now().strftime('%Y-%m-%d')}.log"
+    log_name = f"nh_supreme_court_supervisory_orders-{datetime.now().strftime('%Y-%m-%d')}.log"
     log_path = LOG_DIR / log_name
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
@@ -147,7 +149,7 @@ def parse_case_date(text: str) -> str:
 
 
 def cleanup_temp_downloads(logger: logging.Logger) -> None:
-    for p in PDF_DIR.glob("*.crdownload"):
+    for p in TEMP_PDF_DIR.glob("*.crdownload"):
         try:
             p.unlink(missing_ok=True)
             logger.info("Removed stale temp download: %s", p.name)
@@ -173,7 +175,7 @@ def build_chrome_options(headless: bool) -> Options:
     options.add_argument(f"--user-agent={DESKTOP_USER_AGENT}")
 
     prefs = {
-        "download.default_directory": str(PDF_DIR),
+        "download.default_directory": str(TEMP_PDF_DIR),
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
         "download_restrictions": 0,
@@ -198,7 +200,7 @@ def get_driver(headless: bool) -> webdriver.Chrome:
             "Page.setDownloadBehavior",
             {
                 "behavior": "allow",
-                "downloadPath": str(PDF_DIR),
+                "downloadPath": str(TEMP_PDF_DIR),
             },
         )
     except Exception:
@@ -543,12 +545,12 @@ def scrape_all_pages_for_year(driver: webdriver.Chrome, year: int, logger: loggi
     return all_items
 
 
-def snapshot_files() -> Set[str]:
-    return {p.name for p in PDF_DIR.iterdir() if p.is_file()}
+def snapshot_files(download_dir: Path) -> Set[str]:
+    return {p.name for p in download_dir.iterdir() if p.is_file()}
 
 
-def newest_completed_pdf(before_names: Set[str]) -> Optional[Path]:
-    current_files = [p for p in PDF_DIR.iterdir() if p.is_file()]
+def newest_completed_pdf(before_names: Set[str], download_dir: Path) -> Optional[Path]:
+    current_files = [p for p in download_dir.iterdir() if p.is_file()]
     candidates = [
         p for p in current_files
         if p.name not in before_names and not p.name.endswith(".crdownload")
@@ -558,14 +560,19 @@ def newest_completed_pdf(before_names: Set[str]) -> Optional[Path]:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def wait_for_download(before_files: Set[str], timeout: int = 120, stable_checks: int = 3) -> Optional[Path]:
+def wait_for_download(
+    before_files: Set[str],
+    download_dir: Path,
+    timeout: int = 120,
+    stable_checks: int = 3,
+) -> Optional[Path]:
     start = time.time()
     last_seen_name = None
     stable_count = 0
 
     while time.time() - start < timeout:
-        crdownloads = list(PDF_DIR.glob("*.crdownload"))
-        candidate = newest_completed_pdf(before_files)
+        crdownloads = list(download_dir.glob("*.crdownload"))
+        candidate = newest_completed_pdf(before_files, download_dir)
 
         if crdownloads:
             stable_count = 0
@@ -587,25 +594,45 @@ def wait_for_download(before_files: Set[str], timeout: int = 120, stable_checks:
     return None
 
 
+def build_pdf_destination(
+    year: int,
+    case_number: str,
+    case_title: str,
+    pdf_url: str,
+) -> Path:
+    case_folder_raw = case_title.strip() or case_number.strip() or Path(pdf_url).stem or "case"
+    case_folder = make_safe_filename(case_number, max_len=120)
+
+    base_name = " ".join(x for x in [case_number.strip(), case_title.strip()] if x).strip()
+    if not base_name:
+        base_name = Path(pdf_url).stem or "document"
+    final_name = make_safe_filename(base_name) + ".pdf"
+
+    case_dir = COURT_DIR / str(year) / case_folder
+    case_dir.mkdir(parents=True, exist_ok=True)
+    return case_dir / final_name
+
+
 def download_pdf_via_chrome(
     driver: webdriver.Chrome,
+    year: int,
     pdf_url: str,
     case_number: str,
     case_title: str,
     logger: logging.Logger,
 ) -> str:
-    base_name = " ".join(x for x in [case_number.strip(), case_title.strip()] if x).strip()
-    if not base_name:
-        base_name = Path(pdf_url).stem or "document"
-
-    final_name = make_safe_filename(base_name) + ".pdf"
-    final_path = PDF_DIR / final_name
+    final_path = build_pdf_destination(
+        year=year,
+        case_number=case_number,
+        case_title=case_title,
+        pdf_url=pdf_url,
+    )
 
     if final_path.exists() and final_path.stat().st_size > 0:
         logger.info("PDF already exists, skipping download: %s", final_path.name)
         return str(final_path)
 
-    before_files = snapshot_files()
+    before_files = snapshot_files(TEMP_PDF_DIR)
 
     try:
         driver.get(pdf_url)
@@ -613,7 +640,11 @@ def download_pdf_via_chrome(
         logger.error("Could not open PDF URL in Chrome: %s | %s", pdf_url, e)
         return ""
 
-    downloaded_file = wait_for_download(before_files=before_files, timeout=120)
+    downloaded_file = wait_for_download(
+        before_files=before_files,
+        download_dir=TEMP_PDF_DIR,
+        timeout=120,
+    )
 
     if downloaded_file is None:
         logger.error("Download timeout or no file downloaded: %s", pdf_url)
@@ -626,7 +657,7 @@ def download_pdf_via_chrome(
 
         if final_path.exists():
             suffix = datetime.now().strftime("%Y%m%d%H%M%S")
-            final_path = PDF_DIR / f"{final_path.stem}_{suffix}.pdf"
+            final_path = final_path.with_name(f"{final_path.stem}_{suffix}.pdf")
 
         downloaded_file.rename(final_path)
         logger.info("Downloaded PDF: %s", final_path.name)
@@ -643,7 +674,7 @@ def download_pdf_via_chrome(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="NH Supreme Court Opinions scraper")
+    parser = argparse.ArgumentParser(description="NH Supreme Court Supervisory Orders scraper")
     parser.add_argument("--headless", type=int, default=1, help="1=headless, 0=visible Chrome")
     args = parser.parse_args()
 
@@ -732,6 +763,7 @@ def main() -> None:
 
                 local_pdf_path = download_pdf_via_chrome(
                     driver=driver,
+                    year=year,
                     pdf_url=pdf_url,
                     case_number=item["case_number"],
                     case_title=item["case_title"],

@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -28,8 +28,9 @@ from selenium.webdriver.common.by import By
 YEARLY_URL_TEMPLATE = "https://www.courts.maine.gov/courts/sjc/lawcourt/{year}/index.html"
 CURRENT_YEAR_URL = "https://www.courts.maine.gov/courts/sjc/opinions.html"
 
-CSV_PATH = Path("downloads") / "CSV" / "maine_published_opinions.csv"
-PDF_DIR = Path("downloads") / "PDF"
+CSV_PATH = Path("downloads") / "supreme_court" / "CSV" / "supreme_court.csv"
+DOWNLOADS_ROOT = Path("downloads")
+COURT_FOLDER_NAME = "supreme_court"
 LOG_DIR = Path("Log")
 
 CSV_COLUMNS = [
@@ -43,13 +44,13 @@ CSV_COLUMNS = [
 
 def setup_dirs() -> None:
     CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PDF_DIR.mkdir(parents=True, exist_ok=True)
+    DOWNLOADS_ROOT.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logging() -> logging.Logger:
     log_date = datetime.now().strftime("%Y-%m-%d")
-    log_path = LOG_DIR / f"maine_published_opinions_{log_date}.log"
+    log_path = LOG_DIR / f"maine_supreme_court_{log_date}.log"
 
     logger = logging.getLogger("maine_scraper")
     logger.setLevel(logging.INFO)
@@ -155,6 +156,15 @@ def safe_filename(value: str) -> str:
     return value[:180]
 
 
+def extract_year(*values: str) -> str:
+    for raw in values:
+        value = clean_text(raw)
+        match = re.search(r"(19|20)\d{2}", value)
+        if match:
+            return match.group(0)
+    return "unknown_year"
+
+
 def load_existing_rows(logger: logging.Logger) -> Tuple[Set[str], Set[Tuple[str, str]]]:
     seen_pdf_urls: Set[str] = set()
     seen_keys: Set[Tuple[str, str]] = set()
@@ -195,6 +205,8 @@ def download_pdf(
     out_path: Path,
     logger: logging.Logger,
 ) -> bool:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
     if out_path.exists() and out_path.stat().st_size > 0:
         logger.info("PDF already exists, skipping download: %s", out_path.name)
         return True
@@ -237,10 +249,16 @@ def get_target_urls() -> List[str]:
     return urls
 
 
-def make_pdf_path(opinion_number: str, case_name: str, pdf_url: str) -> Path:
-    ext = Path(pdf_url).suffix or ".pdf"
+def make_pdf_path(opinion_number: str, case_name: str, date_filed: str, pdf_url: str) -> Path:
+    court_folder = safe_filename(COURT_FOLDER_NAME) or "court"
+    year_folder = extract_year(date_filed, opinion_number, pdf_url)
+    case_folder = safe_filename(opinion_number) or "unknown_case"
+
+    pdf_url_path = urlparse(pdf_url).path
+    ext = Path(pdf_url_path).suffix or ".pdf"
     filename = safe_filename(f"{opinion_number} - {case_name}") + ext
-    return PDF_DIR / filename
+
+    return DOWNLOADS_ROOT / court_folder / year_folder / case_folder / filename
 
 
 def scrape_rows_from_page(driver: webdriver.Chrome, page_url: str, logger: logging.Logger) -> List[Dict[str, str]]:
@@ -420,7 +438,7 @@ def main() -> None:
                     total_skip += 1
                     continue
 
-                pdf_path = make_pdf_path(opinion_number, case_name, pdf_url)
+                pdf_path = make_pdf_path(opinion_number, case_name, date_filed, pdf_url)
 
                 logger.info(
                     "[page %s row %s] Processing: %s | %s",

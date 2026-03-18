@@ -13,6 +13,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -39,10 +40,11 @@ except Exception:
 
 
 DEFAULT_BASE_URL = (
-    "https://cdm17027.contentdm.oclc.org/digital/search/collection/"
-    "p17027coll8!p17027coll7/order/dated/ad/desc/page/1"
+    "https://cdm17027.contentdm.oclc.org/digital/collection/"
+    "p17027coll7/search/order/dated/ad/desc/page/1"
 )
 BASE_DOMAIN = "https://cdm17027.contentdm.oclc.org"
+DEFAULT_COURT_NAME = "Oregon Supreme Court"
 
 CSV_HEADERS = [
     "Briefs",
@@ -96,18 +98,13 @@ def setup_logging(log_dir: Path) -> logging.Logger:
 
 def ensure_folders(base_dir: Path) -> Dict[str, Path]:
     downloads_dir = base_dir / "downloads"
-    csv_dir = downloads_dir / "CSV"
-    pdf_dir = downloads_dir / "PDF"
     log_dir = base_dir / "Log"
 
-    csv_dir.mkdir(parents=True, exist_ok=True)
-    pdf_dir.mkdir(parents=True, exist_ok=True)
+    downloads_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     return {
         "downloads": downloads_dir,
-        "csv": csv_dir,
-        "pdf": pdf_dir,
         "log": log_dir,
     }
 
@@ -263,6 +260,55 @@ def parse_case_number_and_type(title_text: str) -> Tuple[str, str]:
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return "", ""
+
+
+def sanitize_path_component(value: str, fallback: str) -> str:
+    text = re.sub(r"\s+", " ", (value or "").strip())
+    text = text.replace("/", " ").replace("\\", " ")
+    text = re.sub(r'[:*?"<>|]+', "", text)
+    text = text.strip(" .")
+    if not text:
+        text = fallback
+    return text[:120]
+
+
+def extract_year(value: str) -> str:
+    match = re.search(r"\b(19|20)\d{2}\b", value or "")
+    return match.group(0) if match else ""
+
+
+def build_pdf_storage_paths(
+    downloads_dir: Path,
+    item_id: str,
+    fields: Dict[str, str],
+) -> Tuple[Path, str]:
+    court_name_raw = clean_briefs_value(fields.get("briefs", ""))
+    year_raw = (
+        extract_year(fields.get("date_decided", ""))
+        or extract_year(fields.get("citation", ""))
+        or "unknown_year"
+    )
+    case_folder_raw = (
+        (fields.get("case_number", "") or "").strip()
+        or (fields.get("title_primary", "") or "").strip()
+        or (fields.get("official_case_name", "") or "").strip()
+        or f"case_{item_id}"
+    )
+
+    court_name = sanitize_path_component(court_name_raw, "unknown_court")
+    year = sanitize_path_component(year_raw, "unknown_year")
+    case_folder = sanitize_path_component(case_folder_raw, f"case_{item_id}")
+    filename = f"{item_id}.pdf"
+
+    local_pdf_path = downloads_dir / court_name / year / case_folder / filename
+    csv_pdf_path = str(Path("downloads") / court_name / year / case_folder / filename)
+    return local_pdf_path, csv_pdf_path
+
+
+def build_csv_storage_path(downloads_dir: Path, court_name: str, csv_name: str) -> Path:
+    court_folder = sanitize_path_component(court_name, "unknown_court")
+    csv_filename = "supreme_court_case.csv"
+    return downloads_dir / court_folder / "CSV" / csv_filename
 
 
 def page_load_with_retry(
@@ -865,7 +911,13 @@ def parse_args() -> argparse.Namespace:
         "--csv-name",
         type=str,
         default="case.csv",
-        help="CSV case under downloads/CSV/",
+        help="CSV filename under downloads/<court-name>/CSV/",
+    )
+    parser.add_argument(
+        "--court-name",
+        type=str,
+        default=DEFAULT_COURT_NAME,
+        help="Court folder name under downloads/ (default: Oregon Supreme Court).",
     )
     parser.add_argument(
         "--base-url",
@@ -892,7 +944,12 @@ def main() -> None:
     logger.info("=" * 80)
     logger.info("Scrape run started")
 
-    csv_path = paths["csv"] / args.csv_name
+    csv_path = build_csv_storage_path(paths["downloads"], args.court_name, args.csv_name)
+    legacy_csv_path = paths["downloads"] / "CSV" / (os.path.basename(args.csv_name) or "case.csv")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if not csv_path.exists() and legacy_csv_path.exists():
+        shutil.move(str(legacy_csv_path), str(csv_path))
+        logger.info("Moved legacy CSV to new path: %s -> %s", legacy_csv_path, csv_path)
     ensure_csv_with_header(csv_path)
 
     done_ids, done_pdf_urls = load_existing_index(csv_path)
@@ -1007,8 +1064,12 @@ def main() -> None:
                     random_delay()
                     continue
 
-                local_pdf_path = paths["pdf"] / f"{item_id}.pdf"
-                csv_pdf_path = str(Path("downloads") / "PDF" / f"{item_id}.pdf")
+                local_pdf_path, csv_pdf_path = build_pdf_storage_paths(
+                    paths["downloads"],
+                    item_id,
+                    fields,
+                )
+                local_pdf_path.parent.mkdir(parents=True, exist_ok=True)
                 pdf_status = download_pdf(session, pdf_url, local_pdf_path, logger)
 
                 if pdf_status in {"PDF_ERROR", "PDF_INVALID"}:

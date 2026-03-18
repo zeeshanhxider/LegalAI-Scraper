@@ -1,19 +1,25 @@
 # ga_supreme_all_years.py
-# Scrape all "Opinion Year" pages (2017-2026 etc), write ONE CSV row-by-row (streaming),
-# and download PDFs to: download/{year}/{month}/{pdf_file}
+# Scrape Georgia Supreme Court opinions from START_YEAR to current year,
+# write ONE CSV row-by-row (streaming),
+# and download PDFs to: downloads/{court_name}/{year}/{case_id}/{pdf_file}
 
 import os
 import re
 import csv
+from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse, urljoin
 
 BASE = "https://www.gasupreme.us"
-START_URL = "https://www.gasupreme.us/2026-opinions/"
+START_YEAR = 2017
+CURRENT_YEAR = datetime.now().year
 
-OUT_BASE = "download"  # base folder for CSV + PDFs
-CSV_PATH = os.path.join(OUT_BASE, "ga_supreme_all_years.csv")
+OUT_BASE = "downloads"
+COURT_NAME = "ga_supreme"
+COURT_DIR = os.path.join(OUT_BASE, COURT_NAME)
+CSV_DIR = os.path.join(COURT_DIR, "CSV")
+CSV_PATH = os.path.join(CSV_DIR, "ga_supreme_all_years.csv")
 
 HEADERS = {
     "User-Agent": (
@@ -115,32 +121,24 @@ def download_pdf(pdf_url: str, out_path: str) -> str:
     return "downloaded"
 
 
-def get_year_links(start_html: str):
+def build_year_links(start_year: int, end_year: int):
     """
-    Extract dropdown year links from:
-    <nav class="gcnavbar"> ... Opinion Year ... <a href=".../2025-opinions/">2025</a>
-    Returns list[(year_int, url)] sorted newest->oldest.
+    Build list[(year_int, url)] sorted newest->oldest for explicit year URLs.
+    Example: https://www.gasupreme.us/2026-opinions/
     """
-    soup = BeautifulSoup(start_html, "html.parser")
-    nav = soup.select_one("nav.gcnavbar")
-    if not nav:
-        raise RuntimeError("Could not find nav.gcnavbar (Opinion Year menu).")
+    if start_year > end_year:
+        raise ValueError(f"Invalid year range: {start_year} > {end_year}")
 
     year_links = []
-    for a in nav.select("li ul li a"):
-        txt = (a.get_text(strip=True) or "")
-        href = (a.get("href") or "").strip()
-        if txt.isdigit() and len(txt) == 4 and href:
-            year_links.append((int(txt), urljoin(BASE, href)))
-
-    year_links.sort(key=lambda x: x[0], reverse=True)
+    for year in range(end_year, start_year - 1, -1):
+        year_links.append((year, f"{BASE}/{year}-opinions/"))
     return year_links
 
 
 def scrape_year_page_streaming(year: int, url: str, writer, csv_file_handle):
     """
     Scrape ONE year page and write rows to CSV immediately (streaming).
-    PDFs saved to download/{year}/{month}/{pdf_file}
+    PDFs saved to downloads/{court_name}/{year}/{case_id}/{pdf_file}
     """
     print(f"\n=== YEAR {year} === {url}")
 
@@ -209,8 +207,9 @@ def scrape_year_page_streaming(year: int, url: str, writer, csv_file_handle):
 
                     pdf_file = filename_from_url(pdf_url)
 
-                    # Folder: download/{year}/{month}/
-                    pdf_dir = os.path.join(OUT_BASE, str(year), month)
+                    # Folder: downloads/{court_name}/{year}/{case_id}/
+                    primary_case_id = safe_filename(case_ids[0]) if case_ids else "unknown_case_id"
+                    pdf_dir = os.path.join(COURT_DIR, str(year), primary_case_id)
                     ensure_dir(pdf_dir)
                     pdf_path = os.path.join(pdf_dir, pdf_file)
 
@@ -250,13 +249,10 @@ def scrape_year_page_streaming(year: int, url: str, writer, csv_file_handle):
 
 
 def main():
-    ensure_dir(OUT_BASE)
+    ensure_dir(COURT_DIR)
+    ensure_dir(CSV_DIR)
 
-    # Fetch one page to get the dropdown year links
-    start = requests.get(START_URL, headers=HEADERS, timeout=60)
-    start.raise_for_status()
-
-    year_links = get_year_links(start.text)
+    year_links = build_year_links(START_YEAR, CURRENT_YEAR)
     print("Found years:", [y for y, _ in year_links])
 
     fieldnames = [
@@ -284,7 +280,7 @@ def main():
     print("\nDONE ✅")
     print("Total rows written:", total_rows)
     print("CSV:", CSV_PATH)
-    print("PDF base folder:", OUT_BASE + "/{year}/{month}/...")
+    print("PDF base folder:", f"{COURT_DIR}/{{year}}/{{case_id}}/...")
 
 
 if __name__ == "__main__":

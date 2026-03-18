@@ -41,22 +41,23 @@ CSV_COLUMNS = [
     "PDF url",
     "Donwload PDF path",
 ]
+COURT_FOLDER = "published_supreme_court"
 
 
 def ensure_folders(base_dir: Path) -> Dict[str, Path]:
-    downloads_dir = base_dir / "downloads/published_supreme_court"
-    csv_dir = downloads_dir / "CSV"
-    pdf_dir = downloads_dir / "PDF"
+    downloads_dir = base_dir / "downloads"
+    court_dir = downloads_dir / COURT_FOLDER
+    csv_dir = court_dir / "CSV"
     log_dir = base_dir / "Log/published_supreme_court"
 
     csv_dir.mkdir(parents=True, exist_ok=True)
-    pdf_dir.mkdir(parents=True, exist_ok=True)
+    court_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     return {
         "downloads_dir": downloads_dir,
+        "court_dir": court_dir,
         "csv_dir": csv_dir,
-        "pdf_dir": pdf_dir,
         "log_dir": log_dir,
     }
 
@@ -83,9 +84,9 @@ def setup_logger(log_dir: Path) -> logging.Logger:
     return logger
 
 
-def load_existing_case_nos(csv_path: Path, pdf_dir: Path) -> Tuple[Set[str], Set[str]]:
+def load_existing_case_nos(csv_path: Path, court_dir: Path) -> Tuple[Set[str], Set[str]]:
     existing_case_nos: Set[str] = set()
-    existing_pdf_case_nos = load_existing_pdf_case_nos(pdf_dir)
+    existing_pdf_case_nos = load_existing_pdf_case_nos(court_dir)
 
     if csv_path.exists():
         with csv_path.open("r", encoding="utf-8-sig", newline="") as infile:
@@ -117,11 +118,20 @@ def load_all_existing_case_nos(csv_dir: Path) -> Set[str]:
     return existing_case_nos
 
 
-def load_existing_pdf_case_nos(pdf_dir: Path) -> Set[str]:
+def load_existing_pdf_case_nos(court_dir: Path) -> Set[str]:
     existing_pdf_case_nos: Set[str] = set()
-    for pdf_file in pdf_dir.glob("*.pdf"):
+    for pdf_file in court_dir.rglob("*.pdf"):
         if pdf_file.is_file():
-            case_no = pdf_file.stem.strip()
+            if "CSV" in pdf_file.parts:
+                continue
+            # Prefer folder name for new layout: downloads/<court>/<year>/<case_no>/<pdf>
+            # Fall back to stem for legacy flat layout: downloads/<court>/PDF/<case_no>.pdf
+            parent_name = pdf_file.parent.name.strip()
+            case_no = (
+                parent_name
+                if parent_name and parent_name.lower() not in {"pdf", "csv"}
+                else pdf_file.stem.strip()
+            )
             if case_no:
                 existing_pdf_case_nos.add(case_no)
     return existing_pdf_case_nos
@@ -250,6 +260,26 @@ def _page_has_no_records_message(driver: webdriver.Chrome) -> bool:
     )
 
 
+def _first_text(case_item, selectors: List[str]) -> str:
+    for selector in selectors:
+        elements = case_item.find_elements(By.CSS_SELECTOR, selector)
+        for element in elements:
+            text = (element.text or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _first_href(case_item, selectors: List[str]) -> str:
+    for selector in selectors:
+        elements = case_item.find_elements(By.CSS_SELECTOR, selector)
+        for element in elements:
+            href = (element.get_attribute("href") or "").strip()
+            if href:
+                return href
+    return ""
+
+
 def scrape_cases_with_selenium(url: str, logger: logging.Logger) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     driver = _build_driver()
@@ -289,16 +319,40 @@ def scrape_cases_with_selenium(url: str, logger: logging.Logger) -> List[Dict[st
 
                 if "accordion-item" in class_name and "case-result" in class_name:
                     try:
-                        raw_case_no = child.find_element(By.CSS_SELECTOR, "p.case-number").text.strip()
+                        raw_case_no = _first_text(
+                            child,
+                            [
+                                "p.case-number",
+                                "span.case-number",
+                                ".case-number",
+                            ],
+                        )
                         case_no = _normalize_case_no(raw_case_no)
-                        case_name = child.find_element(By.CSS_SELECTOR, "p.case-name").text.strip()
-                        description = _get_nonempty_description(child, driver)
-                        try:
-                            pdf_url = child.find_element(By.CSS_SELECTOR, "a.download-link").get_attribute(
-                                "href"
+                        case_name = _first_text(
+                            child,
+                            [
+                                "p.case-name",
+                                "span.case-name",
+                                ".case-name",
+                            ],
+                        )
+                        if not case_no or not case_name:
+                            logger.warning(
+                                "Skipping case item due to missing case_no/case_name. raw_case_no=%r case_name=%r",
+                                raw_case_no,
+                                case_name,
                             )
-                        except NoSuchElementException:
-                            pdf_url = ""
+                            continue
+                        description = _get_nonempty_description(child, driver)
+                        pdf_url = _first_href(
+                            child,
+                            [
+                                "a.download-link",
+                                "a[href$='.pdf']",
+                                "a[href$='.PDF']",
+                                "div.result-info a[href]",
+                            ],
+                        )
 
                         rows.append(
                             {
@@ -438,7 +492,7 @@ def main() -> None:
 
     base_dir = Path(__file__).resolve().parent
     paths = ensure_folders(base_dir)
-    pdf_dir = paths["pdf_dir"]
+    court_dir = paths["court_dir"]
     logger = setup_logger(paths["log_dir"])
 
     logger.info("start")
@@ -456,7 +510,7 @@ def main() -> None:
         logger.info("terms to process: %d (%s -> %s)", len(terms), terms[0], terms[-1])
 
         global_existing_case_nos = load_all_existing_case_nos(paths["csv_dir"])
-        global_existing_pdf_case_nos = load_existing_pdf_case_nos(pdf_dir)
+        global_existing_pdf_case_nos = load_existing_pdf_case_nos(court_dir)
         logger.info(
             "existing records loaded: csv_case_nos=%d, existing_pdfs=%d",
             len(global_existing_case_nos),
@@ -466,9 +520,10 @@ def main() -> None:
         for term in terms:
             url = BASE_URL.format(term=term)
             csv_path = paths["csv_dir"] / f"case.csv"
+            year = term.split("-", 1)[0]
             logger.info("target url: %s", url)
 
-            term_csv_case_nos, _ = load_existing_case_nos(csv_path, pdf_dir)
+            term_csv_case_nos, _ = load_existing_case_nos(csv_path, court_dir)
             existing_case_nos = global_existing_case_nos.union(term_csv_case_nos)
             existing_pdf_case_nos = global_existing_pdf_case_nos
 
@@ -490,7 +545,7 @@ def main() -> None:
                     logger.error("Skipping record with missing case_no or PDF url: %s", row)
                     continue
 
-                pdf_path = pdf_dir / f"{case_no}.pdf"
+                pdf_path = court_dir / year / case_no / f"{case_no}.pdf"
                 if (
                     case_no in existing_case_nos
                     or case_no in existing_pdf_case_nos
@@ -500,8 +555,11 @@ def main() -> None:
                     skipped_duplicates += 1
                     continue
 
+                pdf_path.parent.mkdir(parents=True, exist_ok=True)
                 if download_pdf(pdf_url, pdf_path, logger):
-                    row["Donwload PDF path"] = f"downloads/PDF/{case_no}.pdf"
+                    row["Donwload PDF path"] = (
+                        f"downloads/{COURT_FOLDER}/{year}/{case_no}/{case_no}.pdf"
+                    )
                     rows_to_write.append(row)
                     seen_in_run.add(case_no)
                     global_existing_case_nos.add(case_no)

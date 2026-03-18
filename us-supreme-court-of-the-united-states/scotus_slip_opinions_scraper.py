@@ -15,6 +15,7 @@ BASE = "https://www.supremecourt.gov"
 START_URL = "https://www.supremecourt.gov/opinions/slipopinion"
 
 OUTPUT_ROOT = "downloads"
+COURT_NAME = "us-supreme-court-of-the-united-states"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
@@ -183,32 +184,41 @@ def download_pdf(session: requests.Session, pdf_url: str, out_path: str):
     return "downloaded"
 
 
-def write_term_csv(term_dir: str, term_year: int, rows: list):
-    csv_path = os.path.join(term_dir, f"{term_year}.csv")
+CSV_FIELDNAMES = [
+    "r_number",
+    "date",
+    "docket",
+    "name",
+    "justice",
+    "citation",
+    "term_year",
+    "term_page_url",
+    "pdf_url",
+    "pdf_filename",
+    "download_status",
+]
 
-    fieldnames = [
-        "r_number",
-        "date",
-        "docket",
-        "name",
-        "justice",
-        "citation",
-        "term_year",
-        "term_page_url",
-        "pdf_url",
-        "pdf_filename",
-        "download_status",
-    ]
 
+def init_case_csv(csv_dir: str) -> str:
+    csv_path = os.path.join(csv_dir, "case.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         w.writeheader()
-        for r in sorted(rows, key=lambda x: (x["date"], x["docket"])):
-            w.writerow({k: r.get(k, "") for k in fieldnames})
+    return csv_path
+
+
+def append_case_row(csv_path: str, row: dict):
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        w.writerow({k: row.get(k, "") for k in CSV_FIELDNAMES})
 
 
 def main():
-    ensure_dir(OUTPUT_ROOT)
+    court_root = os.path.join(OUTPUT_ROOT, COURT_NAME)
+    csv_dir = os.path.join(court_root, "CSV")
+    ensure_dir(court_root)
+    ensure_dir(csv_dir)
+    csv_path = init_case_csv(csv_dir)
     session = get_session()
 
     term_urls = discover_term_urls(session, START_URL)
@@ -234,9 +244,9 @@ def main():
             continue
         by_term.setdefault(r["term_year"], []).append(r)
 
-    # Download PDFs + write CSV for each term year
+    # Download PDFs term-wise (year/docket folder structure)
     for term_year, rows in sorted(by_term.items(), reverse=True):
-        term_dir = os.path.join(OUTPUT_ROOT, str(term_year))
+        term_dir = os.path.join(court_root, str(term_year))
         ensure_dir(term_dir)
 
         print(f"\nSaving TERM {term_year} -> {term_dir} ({len(rows)} rows)")
@@ -246,7 +256,9 @@ def main():
             name = safe_filename(r["name"])
 
             pdf_filename = f"{docket} - {name}.pdf"
-            pdf_path = os.path.join(term_dir, pdf_filename)
+            docket_dir = os.path.join(term_dir, docket or "unknown_docket")
+            ensure_dir(docket_dir)
+            pdf_path = os.path.join(docket_dir, pdf_filename)
 
             try:
                 status = download_pdf(session, r["pdf_url"], pdf_path)
@@ -255,12 +267,11 @@ def main():
 
             r["pdf_filename"] = pdf_filename
             r["download_status"] = status
+            append_case_row(csv_path, r)
 
             # polite delay
             time.sleep(random.uniform(0.25, 0.8))
-
-        write_term_csv(term_dir, term_year, rows)
-        print(f"  CSV written: {os.path.join(term_dir, str(term_year) + '.csv')}")
+    print(f"\nCSV written: {csv_path}")
 
     print("\nDone.")
 

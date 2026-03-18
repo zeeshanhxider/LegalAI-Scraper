@@ -9,7 +9,7 @@ Run:
 
 Outputs:
     downloads/CSV/rhode_island_cases.csv
-    downloads/PDF/*.pdf
+    downloads/rhode_island/<year>/<case_title>/<case_number>.pdf
     Log/rhode_island_cases-YYYY-MM-DD.log
 
 Notes:
@@ -17,6 +17,7 @@ Notes:
 - Deduplicates by pdf_url primarily.
 - If run again, already-scraped rows/PDFs are skipped.
 - No database used.
+- CSV columns are fixed exactly as requested.
 """
 
 from __future__ import annotations
@@ -46,7 +47,6 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from selenium.webdriver import ChromeOptions
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webelement import WebElement
@@ -57,12 +57,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 START_URL = "https://www.courts.ri.gov/Pages/ood.aspx"
 
 BASE_DIR = Path(__file__).resolve().parent
-DOWNLOADS_DIR = BASE_DIR / "downloads"
+DOWNLOADS_DIR = BASE_DIR / "downloads" / "supreme_court"
+COURT_NAME_DIR = DOWNLOADS_DIR
 CSV_DIR = DOWNLOADS_DIR / "CSV"
-PDF_DIR = DOWNLOADS_DIR / "PDF"
 LOG_DIR = BASE_DIR / "Log"
 
-CSV_PATH = CSV_DIR / "rhode_island_cases.csv"
+CSV_PATH = CSV_DIR / "supreme_court_cases.csv"
 
 CSV_COLUMNS = [
     "case_title",
@@ -75,7 +75,7 @@ CSV_COLUMNS = [
 
 def ensure_directories() -> None:
     CSV_DIR.mkdir(parents=True, exist_ok=True)
-    PDF_DIR.mkdir(parents=True, exist_ok=True)
+    COURT_NAME_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -88,9 +88,7 @@ def setup_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(formatter)
@@ -134,7 +132,8 @@ def load_existing_keys(
                 if pdf_url:
                     existing_pdf_urls.add(pdf_url)
 
-                existing_fallback_keys.add((case_title, case_number, case_date))
+                if case_title or case_number or case_date:
+                    existing_fallback_keys.add((case_title, case_number, case_date))
 
         logger.info(
             "Existing rows in CSV (dedupe by pdf_url): %s",
@@ -183,24 +182,42 @@ def sanitize_filename(name: str, max_length: int = 180) -> str:
     return name
 
 
+def extract_year_from_case_date(case_date: str) -> str:
+    case_date = (case_date or "").strip()
+    m = re.search(r"\b(19|20)\d{2}\b", case_date)
+    if m:
+        return m.group(0)
+    return "unknown_year"
+
+
+def get_case_pdf_dir(case_number: str, case_date: str) -> Path:
+    year = extract_year_from_case_date(case_date)
+    safe_case_number = sanitize_filename(case_number) or "unknown_case"
+    case_dir = COURT_NAME_DIR / year / safe_case_number
+    case_dir.mkdir(parents=True, exist_ok=True)
+    return case_dir
+
+
 def make_pdf_filename(
     case_number: str,
     case_title: str,
+    case_date: str,
     pdf_url: str,
-    pdf_dir: Path,
 ) -> Path:
+    case_dir = get_case_pdf_dir(case_number, case_date)
+
     base = sanitize_filename(case_number) if case_number.strip() else sanitize_filename(case_title)
     if not base:
         parsed = urlparse(pdf_url)
         base = sanitize_filename(Path(parsed.path).stem) or "document"
 
-    candidate = pdf_dir / f"{base}.pdf"
+    candidate = case_dir / f"{base}.pdf"
     if not candidate.exists():
         return candidate
 
     counter = 2
     while True:
-        candidate = pdf_dir / f"{base}_{counter}.pdf"
+        candidate = case_dir / f"{base}_{counter}.pdf"
         if not candidate.exists():
             return candidate
         counter += 1
@@ -209,19 +226,21 @@ def make_pdf_filename(
 def find_existing_pdf_path_for_same_base(
     case_number: str,
     case_title: str,
-    pdf_dir: Path,
+    case_date: str,
 ) -> Optional[Path]:
+    case_dir = get_case_pdf_dir(case_number, case_date)
     base = sanitize_filename(case_number) if case_number.strip() else sanitize_filename(case_title)
     if not base:
         return None
 
-    direct = pdf_dir / f"{base}.pdf"
+    direct = case_dir / f"{base}.pdf"
     if direct.exists():
         return direct
 
-    matches = sorted(pdf_dir.glob(f"{base}*.pdf"))
+    matches = sorted(case_dir.glob(f"{base}*.pdf"))
     if matches:
         return matches[0]
+
     return None
 
 
@@ -232,12 +251,13 @@ def download_pdf(
     logger: logging.Logger,
     timeout: int = 60,
 ) -> bool:
+    temp_path = target_path.with_suffix(target_path.suffix + ".part")
+
     try:
         with session.get(pdf_url, stream=True, timeout=timeout) as resp:
             resp.raise_for_status()
             content_type = (resp.headers.get("Content-Type") or "").lower()
 
-            # Some servers return octet-stream; allow that too.
             if "pdf" not in content_type and "octet-stream" not in content_type:
                 logger.warning(
                     "Unexpected content type for PDF URL %s: %s",
@@ -245,22 +265,20 @@ def download_pdf(
                     content_type,
                 )
 
-            temp_path = target_path.with_suffix(target_path.suffix + ".part")
             with temp_path.open("wb") as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 64):
                     if chunk:
                         f.write(chunk)
 
-            temp_path.replace(target_path)
-            logger.info("Downloaded PDF: %s", target_path)
-            return True
+        temp_path.replace(target_path)
+        logger.info("Downloaded PDF: %s", target_path)
+        return True
 
     except Exception as exc:
         logger.exception("Failed downloading PDF %s -> %s", pdf_url, exc)
         try:
-            temp_path = target_path.with_suffix(target_path.suffix + ".part")
             if temp_path.exists():
-                temp_path.unlink(missing_ok=True)
+                temp_path.unlink()
         except Exception:
             pass
         return False
@@ -317,6 +335,9 @@ def extract_result_card(card: WebElement) -> Optional[Dict[str, str]]:
         case_title = safe_text(title_link)
         pdf_url = (title_link.get_attribute("href") or "").strip()
 
+        if not case_title or not pdf_url:
+            return None
+
         number_el = None
         date_el = None
 
@@ -333,17 +354,13 @@ def extract_result_card(card: WebElement) -> Optional[Dict[str, str]]:
         case_number = clean_value_after_label(safe_text(number_el), "Number:")
         case_date = clean_value_after_label(safe_text(date_el), "Date:")
 
-        if not case_title or not pdf_url:
-            return None
-
-        record = {
+        return {
             "case_title": case_title,
             "case_number": case_number,
             "case_date": case_date,
             "pdf_url": pdf_url,
             "pdf_local_path": "",
         }
-        return record
 
     except Exception:
         return None
@@ -364,12 +381,9 @@ def get_current_page_cards(driver: webdriver.Chrome) -> List[WebElement]:
 
 
 def get_current_page_signature(driver: webdriver.Chrome) -> str:
-    """
-    Build a lightweight page signature from first few result hrefs/titles
-    so we can detect when page changes after clicking pagination.
-    """
     parts: List[str] = []
     cards = get_current_page_cards(driver)[:5]
+
     for card in cards:
         try:
             a = card.find_element(By.CSS_SELECTOR, "div.title a")
@@ -377,6 +391,7 @@ def get_current_page_signature(driver: webdriver.Chrome) -> str:
             parts.append((a.text or "").strip())
         except Exception:
             continue
+
     return "||".join(parts)
 
 
@@ -431,7 +446,7 @@ def click_next_page(driver: webdriver.Chrome, logger: logging.Logger, timeout: i
         pass
 
     clicked = False
-    click_errors = []
+    errors: List[str] = []
 
     for mode in ("normal", "js"):
         try:
@@ -442,11 +457,11 @@ def click_next_page(driver: webdriver.Chrome, logger: logging.Logger, timeout: i
             clicked = True
             break
         except (ElementClickInterceptedException, WebDriverException, JavascriptException) as exc:
-            click_errors.append(f"{mode}: {exc}")
+            errors.append(f"{mode}: {exc}")
             time.sleep(1.0)
 
     if not clicked:
-        logger.error("Failed clicking next page: %s", " | ".join(click_errors))
+        logger.error("Failed clicking next page: %s", " | ".join(errors))
         return False
 
     wait = WebDriverWait(driver, timeout)
@@ -458,6 +473,7 @@ def click_next_page(driver: webdriver.Chrome, logger: logging.Logger, timeout: i
 
             if old_page is not None and new_page is not None and new_page != old_page:
                 return True
+
             return bool(new_sig and new_sig != old_sig)
         except Exception:
             return False
@@ -507,17 +523,27 @@ def process_record(
         )
         return False
 
-    existing_pdf_path = find_existing_pdf_path_for_same_base(case_number, case_title, PDF_DIR)
+    existing_pdf_path = find_existing_pdf_path_for_same_base(
+        case_number=case_number,
+        case_title=case_title,
+        case_date=case_date,
+    )
 
     if existing_pdf_path and existing_pdf_path.exists():
         record["pdf_local_path"] = str(existing_pdf_path.resolve())
         logger.info("PDF already exists, skipping download: %s", existing_pdf_path)
     else:
-        target_pdf_path = make_pdf_filename(case_number, case_title, pdf_url, PDF_DIR)
+        target_pdf_path = make_pdf_filename(
+            case_number=case_number,
+            case_title=case_title,
+            case_date=case_date,
+            pdf_url=pdf_url,
+        )
         ok = download_pdf(session, pdf_url, target_pdf_path, logger)
         if not ok:
             logger.warning("Skipping CSV write because PDF download failed: %s", pdf_url)
             return False
+
         record["pdf_local_path"] = str(target_pdf_path.resolve())
 
     append_row(CSV_PATH, record)
@@ -545,10 +571,10 @@ def scrape_all(headless: bool) -> None:
     logger.info("Start URL: %s", START_URL)
     logger.info("Headless: %s", headless)
     logger.info("CSV path: %s", CSV_PATH)
-    logger.info("PDF folder path: %s", PDF_DIR)
+    logger.info("PDF root folder path: %s", COURT_NAME_DIR)
 
     session = create_session()
-    driver = None
+    driver: Optional[webdriver.Chrome] = None
 
     total_seen = 0
     total_saved = 0
@@ -575,7 +601,10 @@ def scrape_all(headless: bool) -> None:
                 break
 
             if page_sig in visited_signatures:
-                logger.warning("Detected repeated page signature on page %s. Stopping to avoid loop.", page_index)
+                logger.warning(
+                    "Detected repeated page signature on page %s. Stopping to avoid loop.",
+                    page_index,
+                )
                 break
             visited_signatures.add(page_sig)
 
@@ -594,7 +623,11 @@ def scrape_all(headless: bool) -> None:
                     card = fresh_cards[idx]
                     record = extract_result_card(card)
                     if not record:
-                        logger.warning("Skipped malformed card at page %s item %s", active_page, idx + 1)
+                        logger.warning(
+                            "Skipped malformed card at page %s item %s",
+                            active_page,
+                            idx + 1,
+                        )
                         continue
 
                     total_seen += 1
@@ -609,7 +642,11 @@ def scrape_all(headless: bool) -> None:
                         total_saved += 1
 
                 except StaleElementReferenceException:
-                    logger.warning("Stale card on page %s item %s; skipped.", active_page, idx + 1)
+                    logger.warning(
+                        "Stale card on page %s item %s; skipped.",
+                        active_page,
+                        idx + 1,
+                    )
                     continue
                 except Exception as exc:
                     logger.exception(

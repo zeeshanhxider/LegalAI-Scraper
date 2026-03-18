@@ -31,8 +31,10 @@ URL = "https://www.courts.state.md.us/cgi-bin/indexlist.pl?court=both&year=all&o
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CSV_DIR = os.path.join(BASE_DIR, "downloads", "CSV")
-PDF_DIR = os.path.join(BASE_DIR, "downloads", "PDF")
+COURT_NAME = "appellate_court_opinions"
+DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+COURT_DIR = os.path.join(DOWNLOADS_DIR, COURT_NAME)
+CSV_DIR = os.path.join(COURT_DIR, "CSV")
 LOG_DIR = os.path.join(BASE_DIR, "Log")
 CSV_PATH = os.path.join(CSV_DIR, "cases.csv")
 
@@ -56,8 +58,8 @@ PDF_DELAY_SECONDS = 0.10
 
 
 def ensure_dirs():
+    os.makedirs(COURT_DIR, exist_ok=True)
     os.makedirs(CSV_DIR, exist_ok=True)
-    os.makedirs(PDF_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
 
@@ -129,6 +131,30 @@ def safe_pdf_filename(docket_term: str, filed_date: str, parties: str, case_pdf_
     return f"{base}-{url_hash}.pdf"
 
 
+def safe_docket_folder(docket_term: str) -> str:
+    """
+    Keep docket_term as one folder segment.
+    Example: 2483/23 -> 2483-23
+    """
+    text = (docket_term or "").strip()
+    text = re.sub(r"[\\/]+", "-", text)
+    text = re.sub(r"[^a-zA-Z0-9._-]", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-._")
+    return text or "unknown_docket_term"
+
+
+def extract_filed_year(filed_date: str) -> str:
+    m = re.search(r"\b(\d{4})-\d{2}-\d{2}\b", filed_date or "")
+    return m.group(1) if m else datetime.now().strftime("%Y")
+
+
+def build_pdf_path(docket_term: str, filed_date: str, parties: str, case_pdf_url: str) -> str:
+    year = extract_filed_year(filed_date)
+    docket_folder = safe_docket_folder(docket_term)
+    pdf_name = safe_pdf_filename(docket_term, filed_date, parties, case_pdf_url)
+    return os.path.join(COURT_DIR, year, docket_folder, pdf_name)
+
+
 def build_driver():
     chrome_options = Options()
     if HEADLESS:
@@ -153,6 +179,7 @@ def download_pdf(session: requests.Session, url: str, dest_path: str, logger: lo
     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
         return True
 
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     tmp = dest_path + ".part"
     headers = {"User-Agent": "Mozilla/5.0 (LegalAI-Scraper/1.0)"}
 
@@ -350,8 +377,12 @@ def main():
                     "pdf_local_path": "",
                 }
 
-                pdf_name = safe_pdf_filename(row["docket_term"], row["filed_date"], row["parties"], pdf_url)
-                pdf_path = os.path.join(PDF_DIR, pdf_name)
+                pdf_path = build_pdf_path(
+                    row["docket_term"],
+                    row["filed_date"],
+                    row["parties"],
+                    pdf_url,
+                )
                 row["pdf_local_path"] = pdf_path
 
                 # 2) If PDF already exists => write CSV NOW (resume-safe)

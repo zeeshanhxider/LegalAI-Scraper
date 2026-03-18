@@ -2,6 +2,7 @@ import asyncio
 import csv
 import os
 import re
+from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
@@ -16,9 +17,7 @@ URL = (
     "scopes%5B%5D=sixth_district_court_of_appeal"
 )
 
-OUT_DIR = "download"
-PDF_DIR = os.path.join(OUT_DIR, "pdf")
-CSV_PATH = os.path.join(OUT_DIR, "fl_opinions.csv")
+OUT_DIR = "downloads"
 
 HEADERS = {
     "User-Agent": (
@@ -38,7 +37,6 @@ NEXT_BTN_SEL = "#pagination-next-page"
 
 def ensure_dirs():
     os.makedirs(OUT_DIR, exist_ok=True)
-    os.makedirs(PDF_DIR, exist_ok=True)
 
 
 def safe_filename(name: str, max_len: int = 180) -> str:
@@ -52,6 +50,58 @@ def filename_from_url(pdf_url: str) -> str:
     path = urlparse(pdf_url).path
     base = os.path.basename(path)
     return safe_filename(base or "document.pdf")
+
+
+def year_from_release_date(release_date: str) -> str:
+    release_date = (release_date or "").strip()
+    if not release_date:
+        return "unknown_year"
+
+    formats = [
+        "%m/%d/%y",
+        "%m-%d-%y",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%Y-%m-%d",
+        "%b %d, %Y",
+        "%B %d, %Y",
+    ]
+    for fmt in formats:
+        try:
+            return str(datetime.strptime(release_date, fmt).year)
+        except ValueError:
+            continue
+
+    m = re.search(r"(19|20)\d{2}", release_date)
+    return m.group(0) if m else "unknown_year"
+
+
+def year_from_case_no(case_no: str) -> str:
+    case_no = (case_no or "").strip()
+    if not case_no:
+        return ""
+
+    m = re.search(r"^(19|20)\d{2}", case_no)
+    if m:
+        return m.group(0)
+
+    m = re.search(r"(19|20)\d{2}", case_no)
+    return m.group(0) if m else ""
+
+
+def resolve_year(case_no: str, release_date: str) -> str:
+    case_year = year_from_case_no(case_no)
+    if case_year:
+        return case_year
+    return year_from_release_date(release_date)
+
+
+def get_court_dir(court: str) -> str:
+    return safe_filename(court or "unknown_court")
+
+
+def get_case_dir(case_no: str) -> str:
+    return safe_filename(case_no or "unknown_case_no")
 
 
 def download_pdf(pdf_url: str, out_path: str) -> str:
@@ -109,15 +159,15 @@ async def extract_row(row):
         text = " ".join(text.split())
         by_col[col_id] = text
 
-        a = cell.locator("a[href$='.pdf']").first
+        a = cell.locator("a[href*='.pdf']").first
         if await a.count():
             href = (await a.get_attribute("href")) or ""
             href = href.strip()
-            if href.lower().endswith(".pdf"):
+            if ".pdf" in href.lower():
                 pdf_url = href
 
     if not pdf_url:
-        a2 = row.locator("a[href$='.pdf']").first
+        a2 = row.locator("a[href*='.pdf']").first
         if await a2.count():
             pdf_url = ((await a2.get_attribute("href")) or "").strip()
 
@@ -217,12 +267,11 @@ async def main():
         seen = set()
         total_written = 0
         page_num = 1
+        court_csv_files = {}
+        court_csv_writers = {}
+        court_csv_paths = {}
 
-        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            f.flush()
-
+        try:
             while True:
                 page_range = await get_pagination_text(page)  # e.g. "1-50 of 91216"
                 print(f"\n=== Page {page_num} | {page_range} ===")
@@ -240,10 +289,29 @@ async def main():
                         continue
                     seen.add(key)
 
+                    court_dir = get_court_dir(data["court"])
+                    year_dir = resolve_year(data["case_no"], data["release_date"])
+                    case_dir = get_case_dir(data["case_no"])
+
+                    court_path = os.path.join(OUT_DIR, court_dir)
+                    os.makedirs(court_path, exist_ok=True)
+
+                    if court_dir not in court_csv_writers:
+                        csv_path = os.path.join(court_path, "fl_opinions.csv")
+                        csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+                        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                        writer.writeheader()
+                        csv_file.flush()
+                        court_csv_files[court_dir] = csv_file
+                        court_csv_writers[court_dir] = writer
+                        court_csv_paths[court_dir] = csv_path
+
                     pdf_url = data["pdf_url"]
                     if pdf_url:
+                        case_path = os.path.join(court_path, year_dir, case_dir)
+                        os.makedirs(case_path, exist_ok=True)
                         pdf_file = filename_from_url(pdf_url)
-                        pdf_path = os.path.join(PDF_DIR, pdf_file)
+                        pdf_path = os.path.join(case_path, pdf_file)
                         status = download_pdf(pdf_url, pdf_path)
                     else:
                         pdf_file = ""
@@ -258,8 +326,10 @@ async def main():
                         "page_range": page_range,
                     }
 
+                    writer = court_csv_writers[court_dir]
+                    csv_file = court_csv_files[court_dir]
                     writer.writerow(out_row)
-                    f.flush()
+                    csv_file.flush()
                     total_written += 1
 
                     print(
@@ -280,12 +350,16 @@ async def main():
                     break
 
                 page_num += 1
+        finally:
+            for csv_file in court_csv_files.values():
+                csv_file.close()
 
         await browser.close()
 
         print("\nDONE ✅")
-        print("CSV:", CSV_PATH)
-        print("PDF folder:", PDF_DIR)
+        print("Base folder:", OUT_DIR)
+        for court_dir, csv_path in sorted(court_csv_paths.items()):
+            print(f"CSV ({court_dir}):", csv_path)
         print("Total rows:", total_written)
 
 

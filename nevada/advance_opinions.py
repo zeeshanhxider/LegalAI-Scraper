@@ -9,7 +9,7 @@ Run:
 
 Outputs (relative to this file):
   downloads/advance_opinions/CSV/case.csv
-  downloads/advance_opinions/PDF/*.pdf
+  downloads/supreme_court/<year>/<case_title(case_number)|case_title>/*.pdf
   Log/advance_opinions/advance_opinions-YYYY-MM-DD.log
 
 Notes:
@@ -56,8 +56,10 @@ EXPECTED_COLUMNS = [
 ]
 
 BASE_DIR = Path(__file__).resolve().parent
-CSV_PATH = BASE_DIR / "downloads" / "advance_opinions" / "CSV" / "case.csv"
-PDF_DIR = BASE_DIR / "downloads" / "advance_opinions" / "PDF"
+CSV_PATH = BASE_DIR / "downloads" / "supreme_court" / "advance_opinions" / "CSV" / "case.csv"
+DOWNLOADS_ROOT = BASE_DIR / "downloads"
+COURT_PATH = Path("supreme_court") / "advance_opinions"
+PDF_COURT_DIR = DOWNLOADS_ROOT / COURT_PATH
 LOG_DIR = BASE_DIR / "Log" / "advance_opinions"
 
 
@@ -105,16 +107,40 @@ def parse_year_from_text(text: str) -> str:
     return m.group(0) if m else "unknownyear"
 
 
-def build_pdf_filename(advance_no: str, case_number: str, opinion_filed_on: str) -> str:
+def build_pdf_filename(advance_no: str, case_identifier: str, opinion_filed_on: str) -> str:
     year = parse_year_from_text(opinion_filed_on)
     safe_advance = sanitize_for_filename(advance_no, fallback="unknownadvance")
-    safe_case = sanitize_for_filename(case_number, fallback="unknowncase")
+    safe_case = sanitize_for_filename(case_identifier, fallback="unknowncase")
     return f"{year}_{safe_advance}_{safe_case}.pdf"
+
+
+def build_record_key(advance_no: str, case_number: str, case_title: str) -> Tuple[str, str]:
+    return normalize_text(advance_no), normalize_text(case_number) or normalize_text(case_title)
+
+
+def build_case_folder(case_number: str, case_title: str) -> str:
+    safe_title = sanitize_for_filename(case_title, fallback="untitled_case", max_len=100)
+    safe_case_number = (
+        sanitize_for_filename(case_number, fallback="", max_len=60)
+        if normalize_text(case_number)
+        else ""
+    )
+    if safe_case_number:
+        return f"{safe_case_number}"
+    return safe_title
+
+
+def build_pdf_path(advance_no: str, case_number: str, case_title: str, opinion_filed_on: str) -> Path:
+    year_folder = parse_year_from_text(opinion_filed_on)
+    case_folder = build_case_folder(case_number, case_title)
+    case_identifier = case_number or case_title
+    filename = build_pdf_filename(advance_no, case_identifier, opinion_filed_on)
+    return DOWNLOADS_ROOT / COURT_PATH / year_folder / case_folder / filename
 
 
 def ensure_output_dirs() -> None:
     CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PDF_DIR.mkdir(parents=True, exist_ok=True)
+    PDF_COURT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -200,8 +226,10 @@ def load_existing_keys() -> Set[Tuple[str, str]]:
         for row in reader:
             adv = normalize_text(row.get("advance_no", ""))
             cas = normalize_text(row.get("case_number", ""))
-            if adv and cas:
-                keys.add((adv, cas))
+            title = normalize_text(row.get("case_title", ""))
+            key = (adv, cas or title)
+            if key[0] and key[1]:
+                keys.add(key)
     return keys
 
 
@@ -451,6 +479,8 @@ def download_pdf_file(
     """
     Download and validate bytes start with %PDF-
     """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
     if destination.exists() and destination.stat().st_size > 0:
         return True, pdf_url
 
@@ -509,7 +539,7 @@ def scrape(args: argparse.Namespace) -> int:
 
     csv_header = ensure_csv_file(logger)
     existing_keys = load_existing_keys()
-    existing_pdfs: Set[str] = {p.name for p in PDF_DIR.glob("*.pdf")}
+    existing_pdfs: Set[str] = {str(p.resolve()) for p in PDF_COURT_DIR.rglob("*.pdf")}
 
     driver: Optional[webdriver.Chrome] = None
 
@@ -545,11 +575,12 @@ def scrape(args: argparse.Namespace) -> int:
             opinion_filed_on = row["opinion_filed_on"]
             opinion_date = extract_opinion_date(opinion_filed_on)
 
-            key = (advance_no, case_number)
-            pdf_filename = build_pdf_filename(advance_no, case_number, opinion_filed_on or opinion_date)
-            pdf_path = PDF_DIR / pdf_filename
+            key = build_record_key(advance_no, case_number, case_title)
+            pdf_path = build_pdf_path(advance_no, case_number, case_title, opinion_filed_on or opinion_date)
+            pdf_filename = pdf_path.name
+            pdf_local_path = str(pdf_path.relative_to(BASE_DIR).as_posix())
 
-            if key in existing_keys or pdf_filename in existing_pdfs or pdf_path.exists():
+            if key in existing_keys or str(pdf_path.resolve()) in existing_pdfs or pdf_path.exists():
                 skipped += 1
                 continue
 
@@ -584,7 +615,7 @@ def scrape(args: argparse.Namespace) -> int:
                     continue
 
                 pdf_ok += 1
-                existing_pdfs.add(pdf_filename)
+                existing_pdfs.add(str(pdf_path.resolve()))
 
                 record = {
                     "advance_no": advance_no,
@@ -594,7 +625,7 @@ def scrape(args: argparse.Namespace) -> int:
                     DATE_COLUMN: opinion_date,
                     "docket_url": docket_url,
                     "pdf_url": final_or_err,
-                    "pdf_local_path": pdf_filename,
+                    "pdf_local_path": pdf_local_path,
                 }
                 append_csv_row(record, csv_header)
                 existing_keys.add(key)

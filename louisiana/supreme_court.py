@@ -23,6 +23,7 @@ BASE_URL_TEMPLATE = (
     "https://www.lasc.org/search?query=Kg%3D%3D&cat=All&sort=relevance&page={page}&pagesize={page_size}/"
 )
 OUT_CSV_FILENAME = "lasc_cases.csv"
+COURT_NAME = "Louisiana_Supreme_Court"
 HEADLESS = True
 PAGE_SIZE = 20
 START_PAGE = 1
@@ -118,6 +119,28 @@ def sanitize_filename(name: str) -> str:
     if not cleaned.lower().endswith(".pdf"):
         cleaned = f"{cleaned}.pdf"
     return cleaned
+
+
+def sanitize_path_component(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^\w.\-]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("._")
+    return cleaned[:120] if cleaned else fallback
+
+
+def extract_year(value: str) -> str:
+    text = (value or "").strip()
+    if text:
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y"):
+            try:
+                return str(datetime.strptime(text, fmt).year)
+            except ValueError:
+                continue
+
+        match = re.search(r"\b(19|20)\d{2}\b", text)
+        if match:
+            return match.group(0)
+
+    return str(datetime.now().year)
 
 
 def is_pdf_link(url: str) -> bool:
@@ -240,16 +263,16 @@ def set_row_value(
 
 def ensure_directories(base_dir: Path) -> Dict[str, Path]:
     downloads_dir = base_dir / "downloads"
-    csv_dir = downloads_dir / "CSV"
-    pdf_dir = downloads_dir / "PDF"
+    court_dir = downloads_dir / sanitize_path_component(COURT_NAME, "court")
+    csv_dir = court_dir / "CSV"
     log_dir = base_dir / "Log"
     csv_dir.mkdir(parents=True, exist_ok=True)
-    pdf_dir.mkdir(parents=True, exist_ok=True)
+    court_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     return {
         "downloads": downloads_dir,
+        "court": court_dir,
         "csv": csv_dir,
-        "pdf": pdf_dir,
         "log": log_dir,
     }
 
@@ -508,8 +531,9 @@ def discover_pdf_on_detail_page(
 def download_pdf(
     session: requests.Session,
     pdf_url: str,
-    pdf_dir: Path,
+    court_dir: Path,
     listing_title: str,
+    published_date: str,
     logger: logging.Logger,
 ) -> Tuple[str, bool]:
     parsed = urlparse(pdf_url)
@@ -518,8 +542,13 @@ def download_pdf(
         filename = re.sub(r"\s+", "_", listing_title.strip())[:120]
     filename = sanitize_filename(filename)
 
-    local_path = pdf_dir / filename
-    relative_path = f"downloads/PDF/{filename}"
+    year_folder = extract_year(published_date)
+    listing_folder = sanitize_path_component(listing_title, "untitled_listing")
+    local_dir = court_dir / year_folder / listing_folder
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    local_path = local_dir / filename
+    relative_path = local_path.relative_to(court_dir.parent).as_posix()
 
     if local_path.exists():
         logger.info("PDF already exists: %s", local_path)
@@ -664,8 +693,9 @@ def run() -> None:
                                 pdf_local_path, is_new_download = download_pdf(
                                     session=session,
                                     pdf_url=pdf_url,
-                                    pdf_dir=dirs["pdf"],
+                                    court_dir=dirs["court"],
                                     listing_title=listing_title,
+                                    published_date=published_date,
                                     logger=logger,
                                 )
                                 if is_new_download:

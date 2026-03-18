@@ -23,10 +23,13 @@ TARGET_URL = "https://nvcourts.gov/supreme/decisions/unpublished_orders"
 CASEINFO_BASE = "https://caseinfo.nvsupremecourt.us"
 
 # Required output structure
-BASE_DOWNLOAD = Path("downloads") / "unpublished_orders"
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOADS_ROOT = BASE_DIR / "downloads"
+COURT_PATH = Path("supreme_court") / "unpublished_orders"
+BASE_DOWNLOAD = DOWNLOADS_ROOT / COURT_PATH
 CSV_DIR = BASE_DOWNLOAD / "CSV"
-PDF_DIR = BASE_DOWNLOAD / "PDF"
-LOG_DIR = Path("Log") / "unpublished_orders"
+PDF_DIR = BASE_DOWNLOAD
+LOG_DIR = BASE_DIR / "Log" / "unpublished_orders"
 CSV_PATH = CSV_DIR / "case.csv"
 
 CSV_COLUMNS = [
@@ -67,6 +70,60 @@ def b64decode_str(s: str) -> str:
     pad = (-len(s)) % 4
     s = s + ("=" * pad)
     return base64.b64decode(s).decode("utf-8", errors="replace")
+
+
+def normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip())
+
+
+def sanitize_for_filename(value: str, fallback: str = "unknown", max_len: int = 100) -> str:
+    cleaned = normalize_text(value)
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", cleaned)
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", cleaned)
+    cleaned = cleaned.strip("._-")
+    if not cleaned:
+        cleaned = fallback
+    return cleaned[:max_len]
+
+
+def parse_order_date(order_date: str) -> Tuple[str, str]:
+    date_part = normalize_text(order_date)
+    try:
+        dt = datetime.strptime(date_part, "%b %d, %Y")
+        iso = dt.strftime("%Y-%m-%d")
+        return dt.strftime("%Y"), iso
+    except Exception:
+        pass
+
+    m = re.search(r"(19|20)\d{2}", date_part)
+    year = m.group(0) if m else "unknownyear"
+    token = sanitize_for_filename(date_part, fallback="date", max_len=50)
+    return year, token
+
+
+def build_case_folder(case_number: str, case_title: str) -> str:
+    safe_title = sanitize_for_filename(case_title, fallback="untitled_case", max_len=100)
+    safe_case_number = (
+        sanitize_for_filename(case_number, fallback="", max_len=60)
+        if normalize_text(case_number)
+        else ""
+    )
+    if safe_case_number:
+        return f"{safe_case_number}"
+    return safe_title
+
+
+def build_pdf_filename(case_number: str, case_title: str, order_date: str) -> str:
+    _, date_token = parse_order_date(order_date)
+    case_id = sanitize_for_filename(case_number or case_title, fallback="case", max_len=80)
+    return f"{case_id}__{date_token}.pdf"
+
+
+def build_pdf_destination(case_number: str, case_title: str, order_date: str) -> Path:
+    year_folder, _ = parse_order_date(order_date)
+    case_folder = build_case_folder(case_number, case_title)
+    filename = build_pdf_filename(case_number, case_title, order_date)
+    return PDF_DIR / year_folder / case_folder / filename
 
 
 def build_urls_from_tokens(case_token_b64: str, doc_token_b64: str) -> Tuple[str, str]:
@@ -112,7 +169,7 @@ def make_driver(headless: bool) -> webdriver.Chrome:
 
 def ensure_outputs(logger: logging.Logger):
     CSV_DIR.mkdir(parents=True, exist_ok=True)
-    PDF_DIR.mkdir(parents=True, exist_ok=True)
+    BASE_DOWNLOAD.mkdir(parents=True, exist_ok=True)
     if not CSV_PATH.exists():
         with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
@@ -124,7 +181,7 @@ def ensure_outputs(logger: logging.Logger):
 
 def load_existing_keys() -> set:
     """
-    Dedupe key = (case_number, order_date)
+    Dedupe key = (case_number|case_title, order_date)
     """
     keys = set()
     if not CSV_PATH.exists():
@@ -133,9 +190,11 @@ def load_existing_keys() -> set:
         r = csv.DictReader(f)
         for row in r:
             cn = (row.get("case_number") or "").strip()
+            ct = (row.get("case_title") or "").strip()
             od = (row.get("order_date") or "").strip()
-            if cn and od:
-                keys.add((cn, od))
+            key_id = cn or ct
+            if key_id and od:
+                keys.add((key_id, od))
     return keys
 
 
@@ -154,21 +213,6 @@ def is_pdf_bytes(first_bytes: bytes) -> bool:
     return first_bytes.startswith(b"%PDF-")
 
 
-def safe_filename(case_number: str, order_date: str) -> str:
-    # convert "Feb 24, 2026" -> "2026-02-24" if possible; else safe fallback
-    date_part = order_date.strip()
-    iso = None
-    try:
-        dt = datetime.strptime(date_part, "%b %d, %Y")
-        iso = dt.strftime("%Y-%m-%d")
-    except Exception:
-        # fallback: sanitize raw
-        iso = re.sub(r"[^0-9A-Za-z._-]+", "_", date_part)[:50] or "date"
-
-    cn = re.sub(r"[^0-9A-Za-z._-]+", "_", case_number)[:50] or "case"
-    return f"{cn}__{iso}.pdf"
-
-
 def download_pdf(
     logger: logging.Logger,
     session: requests.Session,
@@ -184,6 +228,9 @@ def download_pdf(
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_path.exists() and out_path.stat().st_size > 0:
+        return str(out_path.resolve())
 
     for attempt in range(1, 4):
         try:
@@ -281,7 +328,7 @@ def scrape(headless: bool, download: bool, limit: int):
                 logger.warning(f"Row missing onclick tokens: case={case_number}")
                 continue
 
-            key = (case_number, order_date)
+            key = (case_number or case_title, order_date)
             if key in existing_keys:
                 continue
 
@@ -293,11 +340,10 @@ def scrape(headless: bool, download: bool, limit: int):
 
             pdf_local_path = ""
             if download:
-                fname = safe_filename(case_number, order_date)
-                out_path = PDF_DIR / fname
+                out_path = build_pdf_destination(case_number, case_title, order_date)
                 saved = download_pdf(logger, session, pdf_url, out_path)
                 if saved:
-                    pdf_local_path = saved
+                    pdf_local_path = str(out_path.relative_to(BASE_DIR).as_posix())
                     logger.info(f"PDF saved: {pdf_local_path}")
                 else:
                     logger.warning(f"PDF NOT saved: case={case_number} url={pdf_url}")
@@ -321,7 +367,7 @@ def scrape(headless: bool, download: bool, limit: int):
 
         logger.info(f"Done. New rows appended: {added}")
         logger.info(f"CSV: {CSV_PATH.resolve()}")
-        logger.info(f"PDF folder: {PDF_DIR.resolve()}")
+        logger.info(f"PDF root: {PDF_DIR.resolve()}")
         logger.info("Scraping finished")
 
     finally:

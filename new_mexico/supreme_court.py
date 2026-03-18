@@ -39,6 +39,10 @@ from selenium.webdriver.support import expected_conditions as EC
 
 
 BASE = "https://nmonesource.com"
+COURT_FOLDER_MAP = {
+    "nmca": "court_of_appeals",
+    "nmsc": "supreme_court",
+}
 
 # Single CSV for everything
 CSV_COLUMNS = [
@@ -369,9 +373,8 @@ def main():
     current_year = datetime.now().year
     years = list(range(start_year, current_year + 1))
 
-    root_downloads = Path("downloads/supreme_court")
-    csv_path = root_downloads / "CSV" / "cases.csv"   # ✅ single CSV
-    pdf_dir = root_downloads / "PDF"
+    root_downloads = Path("downloads")
+    csv_path = root_downloads / "supreme_court" / "CSV" / "cases.csv"   # ✅ single CSV
     log_dir = Path("Log/supreme_court")
 
     logger = setup_logger(log_dir)
@@ -446,9 +449,10 @@ def main():
                         item_url = (it.get("item_url") or "").strip()
                         pdf_url = (it.get("pdf_url") or "").strip()
 
-                        date_part = pub_date.replace("/", "-") if pub_date else f"{year}"
-                        file_name = safe_filename(f"{date_part}_{item_id}_{title}") + ".pdf"
-                        pdf_path = pdf_dir / file_name
+                        court_folder = COURT_FOLDER_MAP.get(court_code, safe_filename(court_code))
+                        case_folder = safe_filename(title) if title else f"case_{item_id}"
+                        file_name = f"{safe_filename(item_id)}.pdf"
+                        pdf_path = root_downloads / court_folder / str(year) / case_folder / file_name
 
                         pdf_local_path = ""
                         if pdf_url:

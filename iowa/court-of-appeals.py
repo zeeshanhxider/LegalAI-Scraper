@@ -11,7 +11,7 @@ Run:
 Outputs are created under:
     Iowa/
       downloads/court-of-appeals/CSV/iowa_court_of_appeals_opinions.csv
-      downloads/court-of-appeals/PDF/*.pdf
+      downloads/court-of-appeals/<year>/<case-title>/*.pdf
       Log/court-of-appeals/iowa-court-of-appeals-YYYY-MM-DD.log
 """
 
@@ -117,6 +117,16 @@ def filed_date_to_iso_or_unknown(filed_date: str) -> str:
         return "unknown-date"
 
 
+def filed_date_to_year_or_unknown(filed_date: str) -> str:
+    if not filed_date:
+        return "unknown-year"
+    try:
+        dt = date_parser.parse(filed_date, fuzzy=True)
+        return dt.strftime("%Y")
+    except Exception:
+        return "unknown-year"
+
+
 def build_record_key(case_no: str, opinion_no: str, case_detail_url: str = "") -> str:
     case_no = normalize_spaces(case_no)
     opinion_no = normalize_spaces(opinion_no)
@@ -129,17 +139,19 @@ def build_record_key(case_no: str, opinion_no: str, case_detail_url: str = "") -
     return ""
 
 
-def build_pdf_relative_path(case_no: str, opinion_no: str, filed_date: str) -> str:
+def build_pdf_relative_path(case_no: str, opinion_no: str, filed_date: str, case_caption: str) -> str:
     id_part = opinion_no if normalize_spaces(opinion_no) else case_no
     id_part = safe_filename_part(id_part or "unknown-case")
     filed_iso = filed_date_to_iso_or_unknown(filed_date)
+    filed_year = filed_date_to_year_or_unknown(filed_date)
+    case_title = safe_filename_part(case_no or case_caption or opinion_no or "unknown-case")
     filename = f"{id_part}__{filed_iso}.pdf"
-    return str(Path("downloads") / "court-of-appeals" / "PDF" / filename).replace("\\", "/")
+    return str(Path("downloads") / "court-of-appeals" / filed_year / case_title / filename).replace("\\", "/")
 
 
 def ensure_directories(base_dir: Path) -> Tuple[Path, Path, Path]:
     downloads_csv_dir = base_dir / "downloads" / "court-of-appeals" / "CSV"
-    downloads_pdf_dir = base_dir / "downloads" / "court-of-appeals" / "PDF"
+    downloads_pdf_dir = base_dir / "downloads" / "court-of-appeals"
     log_dir = base_dir / "Log" / "court-of-appeals"
 
     downloads_csv_dir.mkdir(parents=True, exist_ok=True)
@@ -685,8 +697,9 @@ def process_record(
     row["opinion_no"] = opinion_no
     row["case_detail_url"] = case_detail_url
 
-    desired_pdf_rel = build_pdf_relative_path(case_no, opinion_no, row["filed_date"])
+    desired_pdf_rel = build_pdf_relative_path(case_no, opinion_no, row["filed_date"], row["case_caption"])
     desired_pdf_abs = base_dir / desired_pdf_rel
+    desired_pdf_abs.parent.mkdir(parents=True, exist_ok=True)
 
     existing_rel = normalize_spaces(row.get("pdf_local_path", ""))
     existing_abs = base_dir / existing_rel if existing_rel else None

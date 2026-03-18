@@ -8,10 +8,13 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeoutErro
 BASE = "https://research.coloradojudicial.gov"
 SEARCH_URL = "https://research.coloradojudicial.gov/search/jurisdiction:US+content_type:2+court:14024_02/*"
 
-# Your folders
-CSV_DIR = "download/colorado_court_of_appeals"
-PDF_DIR = "download/colorado_court_of_appeals/pdf"
-CSV_PATH = os.path.join(CSV_DIR, "colorado_court_of_appeals.csv")
+# Folder structure:
+# downloads/<court_name>/CSV/<court_name>.csv
+# downloads/<court_name>/<year>/<docket_number>/<pdf_file>.pdf
+COURT_NAME = "colorado_court_of_appeals"
+ROOT_DIR = os.path.join("downloads", COURT_NAME)
+CSV_DIR = os.path.join(ROOT_DIR, "CSV")
+CSV_PATH = os.path.join(CSV_DIR, f"{COURT_NAME}.csv")
 
 # Search page selectors
 ROW_SEL = "div.results-list li.documento__result-item.document"
@@ -19,7 +22,6 @@ MORE_BTN = "li.section-pager.epag-next-page span.more"
 
 def ensure_dirs():
     os.makedirs(CSV_DIR, exist_ok=True)
-    os.makedirs(PDF_DIR, exist_ok=True)
 
 def safe_filename(name: str, max_len: int = 140) -> str:
     name = name.strip()
@@ -27,17 +29,36 @@ def safe_filename(name: str, max_len: int = 140) -> str:
     name = re.sub(r"\s+", " ", name)
     return name[:max_len].rstrip() if len(name) > max_len else name
 
+def normalize_docket_number(raw: str) -> str:
+    text = re.sub(r"\s+", " ", (raw or "")).strip()
+    text = re.sub(r"(?i)^docket\s*number\s*[:\-]?\s*", "", text).strip()
+    if not text:
+        return ""
+
+    for token in re.split(r"[,\s;|]+", text):
+        token = token.strip()
+        if re.match(r"^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9./-]{3,}$", token):
+            return token
+    return text
+
+def extract_year_value(date_text: str, docket_number: str = "") -> str:
+    m = re.search(r"\b(19|20)\d{2}\b", (date_text or ""))
+    if m:
+        return m.group(0)
+
+    # Fallback: some dockets include year at the end (e.g., 25CA2026).
+    m = re.search(r"(19|20)\d{2}$", (docket_number or ""))
+    if m:
+        return m.group(0)
+
+    return "unknown_year"
+
 async def extract_row(li):
     a = li.locator("a.result").first
     title = (await a.inner_text()).strip() if await a.count() else ""
     href = (await a.get_attribute("href")) if await a.count() else ""
     href = (href or "").strip()
     detail_url = urljoin(BASE, href)
-
-    case_id = ""
-    inner = li.locator("div.inner-content[id]").first
-    if await inner.count():
-        case_id = ((await inner.get_attribute("id")) or "").strip()
 
     values = li.locator("div.result-metadata-properties span.value")
     n = await values.count()
@@ -50,13 +71,83 @@ async def extract_row(li):
     citation = " | ".join(meta[2:]) if len(meta) >= 3 else ""
 
     return {
-        "case_id": case_id,
+        "docket_number": "",
         "title": title,
         "court": court,
         "date": date,
         "citation": citation,
         "detail_url": detail_url,
     }
+
+async def extract_docket_number(detail_page):
+    # Preferred: read the metadata block where the label is exactly "Docket Number".
+    docket = await detail_page.evaluate(
+        """
+        () => {
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim();
+          const isLabel = (s) => /^docket\\s*number$/i.test(norm(s));
+
+          const nodes = Array.from(document.querySelectorAll("div, span, dt, th, p, strong, b, label"));
+          for (const node of nodes) {
+            if (!isLabel(node.textContent)) continue;
+
+            const siblings = [];
+            if (node.nextElementSibling) siblings.push(node.nextElementSibling);
+            const parent = node.parentElement;
+            if (parent) {
+              const children = Array.from(parent.children);
+              const idx = children.indexOf(node);
+              if (idx >= 0) siblings.push(...children.slice(idx + 1));
+            }
+
+            for (const sib of siblings) {
+              const v = norm(sib.textContent);
+              if (v && !isLabel(v)) return v;
+            }
+          }
+          return "";
+        }
+        """
+    )
+    docket = normalize_docket_number(docket)
+    if docket:
+        return docket
+
+    # Fallback: parse visible text lines around "Docket Number".
+    try:
+        body_text = await detail_page.inner_text("body")
+    except Exception:
+        return ""
+
+    lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"docket\s*number", line, flags=re.IGNORECASE):
+            if i + 1 < len(lines):
+                return normalize_docket_number(lines[i + 1])
+        m = re.search(r"docket\s*number\s*[:\-]?\s*([A-Za-z0-9\-/.]+)", line, flags=re.IGNORECASE)
+        if m:
+            return normalize_docket_number(m.group(1))
+
+    return ""
+
+async def wait_for_detail_page_ready(detail_page):
+    try:
+        await detail_page.wait_for_function(
+            "() => document.body && document.body.innerText.includes('Docket Number')",
+            timeout=12000,
+        )
+        return
+    except Exception:
+        pass
+
+    for sel in ("div#formats", "[aria-label='Download']"):
+        try:
+            await detail_page.wait_for_selector(sel, timeout=4000)
+            return
+        except Exception:
+            continue
+
+    await detail_page.wait_for_timeout(1500)
 
 async def wait_and_click_download(detail_page):
     # Your HTML: <div role="button" aria-label="Download" id="formats" ...>
@@ -140,7 +231,7 @@ async def main():
         await search_page.wait_for_selector(ROW_SEL, timeout=120000)
 
         fieldnames = [
-            "case_id", "title", "court", "date", "citation", "detail_url",
+            "docket_number", "title", "court", "date", "citation", "detail_url",
             "pdf_url", "pdf_filename", "download_status", "error"
         ]
 
@@ -161,22 +252,34 @@ async def main():
                     li = rows_loc.nth(i)
                     row = await extract_row(li)
 
-                    key = row["case_id"] or row["detail_url"] or row["title"]
+                    key = row["detail_url"] or row["title"]
                     if key in seen:
                         continue
                     seen.add(key)
 
-                    case_id = row["case_id"] or f"row_{written+1}"
                     title = row["title"] or ""
-                    base_name = safe_filename(f"{case_id}_{title}" if case_id else title)
-                    pdf_filename = f"{base_name}.pdf"
-                    pdf_path = os.path.join(PDF_DIR, pdf_filename)
+                    pdf_filename = ""
+                    pdf_path = ""
 
                     try:
                         # Open detail in a NEW page (do not disturb search page)
                         detail_page = await context.new_page()
                         await detail_page.goto(row["detail_url"], wait_until="domcontentloaded", timeout=120000)
-                        await detail_page.wait_for_timeout(800)
+                        await wait_for_detail_page_ready(detail_page)
+
+                        docket_number = await extract_docket_number(detail_page)
+                        if not docket_number:
+                            await detail_page.wait_for_timeout(2000)
+                            docket_number = await extract_docket_number(detail_page)
+                        row["docket_number"] = docket_number
+
+                        year_value = extract_year_value(row.get("date", ""), docket_number)
+                        base_id = docket_number or f"row_{written+1}"
+                        base_name = safe_filename(f"{base_id}_{title}" if title else base_id)
+                        pdf_filename = f"{base_name}.pdf"
+                        pdf_dir = os.path.join(ROOT_DIR, year_value, base_id)
+                        os.makedirs(pdf_dir, exist_ok=True)
+                        pdf_path = os.path.join(pdf_dir, pdf_filename)
 
                         pdf_url = await get_pdf_download_url(detail_page)
                         row["pdf_url"] = pdf_url
@@ -199,6 +302,9 @@ async def main():
                             await detail_page.close()
                         except:
                             pass
+                        if not pdf_filename:
+                            base_name = safe_filename(f"row_{written+1}_{title}" if title else f"row_{written+1}")
+                            pdf_filename = f"{base_name}.pdf"
                         row["pdf_url"] = row.get("pdf_url", "")
                         row["pdf_filename"] = pdf_filename
                         row["download_status"] = "failed"
@@ -236,6 +342,6 @@ async def main():
         await browser.close()
         print("DONE ✅")
         print("CSV:", CSV_PATH)
-        print("PDF folder:", PDF_DIR)
+        print("PDF root folder:", ROOT_DIR)
 
 asyncio.run(main())

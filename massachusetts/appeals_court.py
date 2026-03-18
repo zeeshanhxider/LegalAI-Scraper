@@ -23,10 +23,11 @@ DEFAULT_START_URL = "https://128archive.com/"
 
 ROOT_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = ROOT_DIR / "downloads"
-CSV_DIR = DOWNLOADS_DIR / "CSV"
-PDF_DIR = DOWNLOADS_DIR / "PDF"
+COURT_NAME = "appeals_court"
+COURT_DIR = DOWNLOADS_DIR / COURT_NAME
+CSV_DIR = COURT_DIR / "CSV"
 LOG_DIR = ROOT_DIR / "Log"
-CSV_PATH = CSV_DIR / "cases.csv"
+CSV_PATH = CSV_DIR / "appeals_court_cases.csv"
 
 CSV_COLUMNS = [
     "docket_number",
@@ -55,7 +56,6 @@ def safe_text(value: str) -> str:
 
 def ensure_dirs() -> None:
     CSV_DIR.mkdir(parents=True, exist_ok=True)
-    PDF_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -188,6 +188,14 @@ def build_pdf_filename(case: dict[str, str]) -> str:
     release = sanitize_filename_component(case["release_date"], max_len=20)
     docket = sanitize_filename_component(case["docket_number"], max_len=80)
     return f"{release}_{docket}.pdf"
+
+
+def build_pdf_output_path(case: dict[str, str]) -> Path:
+    release_date = safe_text(case.get("release_date", ""))
+    year = release_date[:4] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", release_date) else "unknown_year"
+    docket_folder = sanitize_filename_component(case.get("docket_number", ""), max_len=120)
+    filename = build_pdf_filename(case)
+    return COURT_DIR / year / docket_folder / filename
 
 
 def is_valid_pdf(path: Path) -> bool:
@@ -616,8 +624,8 @@ def download_pdf(
     if not pdf_url:
         return "", "missing_pdf_url"
 
-    filename = build_pdf_filename(case)
-    output_path = PDF_DIR / filename
+    output_path = build_pdf_output_path(case)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     relative_path = output_path.relative_to(ROOT_DIR).as_posix()
 
     if output_path.exists() and is_valid_pdf(output_path):
