@@ -6,8 +6,8 @@ NC Courts - Appellate Court Opinions scraper
 URL: https://www.nccourts.gov/documents/appellate-court-opinions
 
 Outputs:
-- CSV: download/appellate_court_opinions/nc_appellate_opinions.csv
-- Files (pdf/zip): download/appellate_court_opinions/file/
+- CSV: downloads/<court_name>/nc_appellate_opinions.csv
+- Files (pdf/zip): downloads/<court_name>/<year>/<case_name>/
 
 Features:
 - Follows pagination using "Next" until it disappears (fixes the "only 9 pages" bug)
@@ -30,9 +30,22 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.nccourts.gov/documents/appellate-court-opinions"
 
-OUT_DIR = "download/appellate_court_opinions"
-FILES_DIR = os.path.join(OUT_DIR, "file")
-CSV_PATH = os.path.join(OUT_DIR, "nc_appellate_opinions.csv")
+DOWNLOADS_DIR = "downloads"
+CSV_FILENAME = "nc_appellate_opinions.csv"
+CSV_FIELDS = [
+    "date",
+    "court",
+    "status",
+    "docket",
+    "case_name",
+    "description",
+    "page_url",
+    "pdf_url",
+    "zip_url",
+    "downloaded_pdf",
+    "downloaded_zip",
+    "download_status",
+]
 
 # polite delay between page fetches
 PAGE_DELAY_SEC = 0.5
@@ -61,8 +74,7 @@ class Row:
 
 
 def ensure_dirs():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    os.makedirs(FILES_DIR, exist_ok=True)
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 
 def clean_ws(s: str) -> str:
@@ -85,6 +97,44 @@ def pick_filename_from_url(url: str) -> str:
     except Exception:
         pass
     return "download.bin"
+
+
+def extract_year(date_text: str) -> str:
+    m = re.search(r"\b(19|20)\d{2}\b", date_text or "")
+    return m.group(0) if m else "unknown_year"
+
+
+def get_court_dir(court: str) -> str:
+    court_folder = safe_filename(court, default="unknown_court")
+    court_dir = os.path.join(DOWNLOADS_DIR, court_folder)
+    os.makedirs(court_dir, exist_ok=True)
+    return court_dir
+
+
+def get_case_dir(court: str, date_text: str, case_name: str) -> str:
+    court_dir = get_court_dir(court)
+    year_dir = os.path.join(court_dir, extract_year(date_text))
+    case_dir = os.path.join(year_dir, safe_filename(case_name, default="unknown_case"))
+    os.makedirs(case_dir, exist_ok=True)
+    return case_dir
+
+
+def get_csv_writer(court: str, csv_writers: dict, csv_files: dict):
+    court_dir = get_court_dir(court)
+    csv_path = os.path.join(court_dir, CSV_FILENAME)
+    if csv_path in csv_writers:
+        return csv_writers[csv_path], csv_files[csv_path], csv_path
+
+    file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+    csv_f = open(csv_path, "a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(csv_f, fieldnames=CSV_FIELDS)
+    if not file_exists:
+        writer.writeheader()
+        csv_f.flush()
+
+    csv_writers[csv_path] = writer
+    csv_files[csv_path] = csv_f
+    return writer, csv_f, csv_path
 
 
 def download_file(session: requests.Session, url: str, out_path: str, timeout=60) -> bool:
@@ -126,9 +176,9 @@ def parse_article(article) -> Row:
 
     # meta spans: variable length
     spans = [clean_ws(s.get_text()) for s in article.select(".meta span") if clean_ws(s.get_text())]
-    court = spans[0] if len(spans) >= 1 else ""
+    court = spans[1] if len(spans) >= 3 else ""
     status = spans[-1] if len(spans) >= 2 else ""
-    docket = spans[1] if len(spans) >= 3 else ""  # only present for opinion rows
+    docket = spans[0] if len(spans) >= 1 else ""  # only present for opinion rows
 
     # case name
     case_name = clean_ws(title_a.get_text()) if title_a else ""
@@ -193,29 +243,9 @@ def main():
     session = requests.Session()
     session.headers.update({"User-Agent": UA})
 
-    # Prepare CSV writer (streaming / append-safe)
-    file_exists = os.path.exists(CSV_PATH) and os.path.getsize(CSV_PATH) > 0
-    csv_f = open(CSV_PATH, "a", newline="", encoding="utf-8")
-    writer = csv.DictWriter(
-        csv_f,
-        fieldnames=[
-            "date",
-            "court",
-            "status",
-            "docket",
-            "case_name",
-            "description",
-            "page_url",
-            "pdf_url",
-            "zip_url",
-            "downloaded_pdf",
-            "downloaded_zip",
-            "download_status",
-        ],
-    )
-    if not file_exists:
-        writer.writeheader()
-        csv_f.flush()
+    # One CSV per court folder: downloads/<court_name>/nc_appellate_opinions.csv
+    csv_writers = {}
+    csv_files = {}
 
     count_items = 0
     count_pages = 0
@@ -247,6 +277,7 @@ def main():
 
         for art in articles:
             row = parse_article(art)
+            case_dir = get_case_dir(row.court, row.date, row.case_name)
 
             # Download file(s)
             status_parts = []
@@ -256,7 +287,7 @@ def main():
                 # Example zip url: getopzip.php?c=2&d=...
                 # We'll name it with date + status for clarity
                 zip_name = safe_filename(f"{row.case_name} {row.date}") + ".zip"
-                zip_path = os.path.join(FILES_DIR, zip_name)
+                zip_path = os.path.join(case_dir, zip_name)
                 ok = download_file(session, row.zip_url, zip_path)
                 row.downloaded_zip = "zip:ok" if ok else "zip:fail"
                 status_parts.append(row.downloaded_zip)
@@ -280,7 +311,7 @@ def main():
                     if not pdf_name.lower().endswith(".pdf"):
                         pdf_name = f"{base}.pdf"
 
-                pdf_path = os.path.join(FILES_DIR, pdf_name)
+                pdf_path = os.path.join(case_dir, pdf_name)
                 ok = download_file(session, row.pdf_url, pdf_path)
                 row.downloaded_pdf = "pdf:ok" if ok else "pdf:fail"
                 status_parts.append(row.downloaded_pdf)
@@ -290,7 +321,8 @@ def main():
             else:
                 row.download_status = "|".join(status_parts)
 
-            # Write streaming CSV row
+            # Write streaming CSV row in the corresponding court folder
+            writer, csv_f, _ = get_csv_writer(row.court, csv_writers, csv_files)
             writer.writerow(
                 {
                     "date": row.date,
@@ -324,10 +356,14 @@ def main():
         url = next_url
         time.sleep(PAGE_DELAY_SEC)
 
-    csv_f.close()
+    for csv_f in csv_files.values():
+        csv_f.close()
+
     print("\n✅ Done")
-    print(f"CSV : {CSV_PATH}")
-    print(f"Files: {FILES_DIR}")
+    print(f"Download root: {DOWNLOADS_DIR}")
+    print(f"CSV files written: {len(csv_files)}")
+    for csv_path in sorted(csv_files):
+        print(f" - {csv_path}")
     print(f"Pages scraped: {count_pages}")
     print(f"Rows written  : {count_items}")
 

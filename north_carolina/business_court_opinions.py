@@ -6,8 +6,8 @@ NC Courts - Business Court Opinions scraper
 URL: https://www.nccourts.gov/documents/business-court-opinions
 
 Outputs:
-- CSV : download/business_court_opinions/business_court_opinions.csv
-- Files: download/business_court_opinions/file/
+- CSV : downloads/Business Court/business_court_opinions.csv
+- PDFs: downloads/Business Court/<year>/<case_name>/<pdf-file>
 
 Notes:
 - Business court pages have an EMPTY court span in meta; we set court="Business Court"
@@ -23,16 +23,16 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 
 import requests
 from bs4 import BeautifulSoup
 
 
 BASE_URL = "https://www.nccourts.gov/documents/business-court-opinions"
+COURT_NAME = "Business Court"
 
-OUT_ROOT = os.path.join("download", "business_court_opinions")
-FILES_DIR = os.path.join(OUT_ROOT, "file")
+OUT_ROOT = os.path.join("downloads", COURT_NAME)
 CSV_PATH = os.path.join(OUT_ROOT, "business_court_opinions.csv")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36"
@@ -41,6 +41,7 @@ PAGE_DELAY_SEC = 0.5
 MAX_PAGES = None   # set e.g. 5 for test
 MAX_ITEMS = None   # set e.g. 50 for test
 MAX_FILENAME_LEN = 150  # keep paths shorter for Windows MAX_PATH compatibility
+MAX_FETCH_RETRIES = 3
 
 
 @dataclass
@@ -61,7 +62,6 @@ class Row:
 
 def ensure_dirs():
     os.makedirs(OUT_ROOT, exist_ok=True)
-    os.makedirs(FILES_DIR, exist_ok=True)
 
 
 def clean_ws(s: str) -> str:
@@ -98,10 +98,49 @@ def pick_filename_from_url(url: str) -> str:
     return "download.bin"
 
 
+def extract_year(date_text: str) -> str:
+    m = re.search(r"\b(19|20)\d{2}\b", date_text or "")
+    return m.group(0) if m else "unknown_year"
+
+
+def build_case_dir(row: Row) -> str:
+    year = extract_year(row.date)
+    case_name_dir = safe_filename(row.case_name, default="unknown_case_name", max_len=100)
+    return os.path.join(OUT_ROOT, year, case_name_dir)
+
+
 def fetch_html(session: requests.Session, url: str, timeout=60) -> str:
-    r = session.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+    last_err = None
+    for attempt in range(1, MAX_FETCH_RETRIES + 1):
+        try:
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except requests.RequestException as e:
+            last_err = e
+            if attempt < MAX_FETCH_RETRIES:
+                wait_sec = 1.5 * attempt
+                print(
+                    f"   ⚠️ fetch failed ({attempt}/{MAX_FETCH_RETRIES}) "
+                    f"for {url} -> {e}; retry in {wait_sec:.1f}s"
+                )
+                time.sleep(wait_sec)
+    raise last_err
+
+
+def next_page_by_number(current_url: str) -> str:
+    """
+    Fallback when a page returns persistent errors:
+    increment ?page=<n> to ?page=<n+1>.
+    """
+    try:
+        p = urlparse(current_url)
+        qs = parse_qs(p.query)
+        current_page = int((qs.get("page") or ["0"])[0])
+        qs["page"] = [str(current_page + 1)]
+        return p._replace(query=urlencode(qs, doseq=True)).geturl()
+    except Exception:
+        return ""
 
 
 def download_file(session: requests.Session, url: str, out_path: str, timeout=120) -> bool:
@@ -238,6 +277,7 @@ def main():
 
     pages = 0
     rows = 0
+    consecutive_fetch_failures = 0
 
     while url:
         if url in visited:
@@ -251,7 +291,27 @@ def main():
             break
 
         print(f"\nPage {pages} | {url}")
-        html = fetch_html(session, url)
+        try:
+            html = fetch_html(session, url)
+            consecutive_fetch_failures = 0
+        except requests.RequestException as e:
+            consecutive_fetch_failures += 1
+            print(f"⚠️ Page fetch failed: {url} -> {e}")
+
+            fallback_url = next_page_by_number(url)
+            if (
+                fallback_url
+                and fallback_url not in visited
+                and consecutive_fetch_failures <= 5
+            ):
+                print(f"   ⏭️ skipping failed page, trying: {fallback_url}")
+                url = fallback_url
+                time.sleep(PAGE_DELAY_SEC)
+                continue
+
+            print("Too many page fetch failures (or no safe fallback). Stop.")
+            break
+
         soup = BeautifulSoup(html, "html.parser")
 
         articles = soup.select("section.list--documents article.list__item")
@@ -291,7 +351,9 @@ def main():
                 if not out_name.lower().endswith(".pdf"):
                     out_name += ".pdf"
 
-                pdf_path = os.path.join(FILES_DIR, out_name)
+                case_dir = build_case_dir(row)
+                os.makedirs(case_dir, exist_ok=True)
+                pdf_path = os.path.join(case_dir, out_name)
                 ok = download_file(session, row.pdf_url, pdf_path)
                 row.downloaded_pdf = "pdf:ok" if ok else "pdf:fail"
                 status_parts.append(row.downloaded_pdf)
@@ -299,7 +361,9 @@ def main():
             # ZIP download (if ever present)
             if row.zip_url:
                 zip_name = safe_filename(f"{row.case_name}_{row.date}") + ".zip"
-                zip_path = os.path.join(FILES_DIR, zip_name)
+                case_dir = build_case_dir(row)
+                os.makedirs(case_dir, exist_ok=True)
+                zip_path = os.path.join(case_dir, zip_name)
                 ok = download_file(session, row.zip_url, zip_path)
                 row.downloaded_zip = "zip:ok" if ok else "zip:fail"
                 status_parts.append(row.downloaded_zip)
@@ -342,7 +406,7 @@ def main():
     csv_f.close()
     print("\n✅ Done")
     print(f"CSV  : {CSV_PATH}")
-    print(f"Files: {FILES_DIR}")
+    print(f"PDFs : {OUT_ROOT}/<year>/<case_name>/")
     print(f"Pages: {pages}")
     print(f"Rows : {rows}")
 
