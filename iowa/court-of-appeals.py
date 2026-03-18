@@ -12,6 +12,7 @@ Outputs are created under:
     Iowa/
       downloads/court-of-appeals/CSV/iowa_court_of_appeals_opinions.csv
       downloads/court-of-appeals/<year>/<case-title>/*.pdf
+      downloads/court-of-appeals/<year>/<case-title>/*.html
       Log/court-of-appeals/iowa-court-of-appeals-YYYY-MM-DD.log
 """
 
@@ -57,6 +58,20 @@ CSV_COLUMNS = [
     "pdf_url",
     "pdf_local_path",
 ]
+
+MERGED_CSV_COLUMNS = [
+    "case_no",
+    "court",
+    "case_caption",
+    "filed_date",
+    "opinion_no",
+    "case_detail_url",
+    "pdf_url",
+    "pdf_local_path",
+]
+
+COURT_NAME = "Court of Appeals"
+MERGED_CSV_REL_PATH = Path("downloads") / "CSV" / "iowa_merged_opinions.csv"
 
 REQUEST_TIMEOUT = 45
 PDF_DOWNLOAD_RETRIES = 3
@@ -147,6 +162,11 @@ def build_pdf_relative_path(case_no: str, opinion_no: str, filed_date: str, case
     case_title = safe_filename_part(case_no or case_caption or opinion_no or "unknown-case")
     filename = f"{id_part}__{filed_iso}.pdf"
     return str(Path("downloads") / "court-of-appeals" / filed_year / case_title / filename).replace("\\", "/")
+
+
+def build_case_html_relative_path(case_no: str, opinion_no: str, filed_date: str, case_caption: str) -> str:
+    pdf_rel = Path(build_pdf_relative_path(case_no, opinion_no, filed_date, case_caption))
+    return str(pdf_rel.with_suffix(".html")).replace("\\", "/")
 
 
 def ensure_directories(base_dir: Path) -> Tuple[Path, Path, Path]:
@@ -260,6 +280,107 @@ def write_csv(csv_path: Path, rows_by_key: Dict[str, Dict[str, str]], key_order:
         for key in key_order:
             row = rows_by_key.get(key, {})
             writer.writerow({col: normalize_spaces(row.get(col, "")) for col in CSV_COLUMNS})
+
+
+def build_merged_record_key(court: str, case_no: str, opinion_no: str, case_detail_url: str) -> str:
+    base_key = build_record_key(case_no, opinion_no, case_detail_url)
+    if not base_key:
+        return ""
+    return f"{normalize_spaces(court)}|{base_key}"
+
+
+def load_existing_merged_csv(merged_csv_path: Path) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    rows_by_key: Dict[str, Dict[str, str]] = {}
+    key_order: List[str] = []
+
+    if not merged_csv_path.exists() or merged_csv_path.stat().st_size == 0:
+        return rows_by_key, key_order
+
+    with merged_csv_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for raw_row in reader:
+            normalized = {col: normalize_spaces(raw_row.get(col, "")) for col in MERGED_CSV_COLUMNS}
+            key = build_merged_record_key(
+                normalized.get("court", ""),
+                normalized.get("case_no", ""),
+                normalized.get("opinion_no", ""),
+                normalized.get("case_detail_url", ""),
+            )
+            if not key or key in rows_by_key:
+                continue
+            rows_by_key[key] = normalized
+            key_order.append(key)
+
+    return rows_by_key, key_order
+
+
+def write_merged_csv(
+    merged_csv_path: Path, rows_by_key: Dict[str, Dict[str, str]], key_order: List[str]
+) -> None:
+    merged_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with merged_csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MERGED_CSV_COLUMNS)
+        writer.writeheader()
+        for key in key_order:
+            row = rows_by_key.get(key, {})
+            writer.writerow({col: normalize_spaces(row.get(col, "")) for col in MERGED_CSV_COLUMNS})
+
+
+def sync_merged_csv_for_court(
+    base_dir: Path,
+    court_rows_by_key: Dict[str, Dict[str, str]],
+    court_key_order: List[str],
+    court_name: str,
+    logger: logging.Logger,
+) -> Path:
+    merged_csv_path = base_dir / MERGED_CSV_REL_PATH
+    merged_rows_by_key, merged_key_order = load_existing_merged_csv(merged_csv_path)
+
+    court_prefix = f"{normalize_spaces(court_name)}|"
+    current_court_keys: Set[str] = set()
+
+    for key in court_key_order:
+        row = court_rows_by_key.get(key, {})
+        merged_row = {
+            "case_no": normalize_spaces(row.get("case_no", "")),
+            "court": normalize_spaces(court_name),
+            "case_caption": normalize_spaces(row.get("case_caption", "")),
+            "filed_date": normalize_spaces(row.get("filed_date", "")),
+            "opinion_no": normalize_spaces(row.get("opinion_no", "")),
+            "case_detail_url": normalize_spaces(row.get("case_detail_url", "")),
+            "pdf_url": normalize_spaces(row.get("pdf_url", "")),
+            "pdf_local_path": normalize_spaces(row.get("pdf_local_path", "")),
+        }
+
+        merged_key = build_merged_record_key(
+            merged_row["court"],
+            merged_row["case_no"],
+            merged_row["opinion_no"],
+            merged_row["case_detail_url"],
+        )
+        if not merged_key:
+            continue
+
+        current_court_keys.add(merged_key)
+        if merged_key not in merged_rows_by_key:
+            merged_key_order.append(merged_key)
+        merged_rows_by_key[merged_key] = merged_row
+
+    stale_keys = [k for k in merged_key_order if k.startswith(court_prefix) and k not in current_court_keys]
+    if stale_keys:
+        stale_set = set(stale_keys)
+        for stale_key in stale_keys:
+            merged_rows_by_key.pop(stale_key, None)
+        merged_key_order = [k for k in merged_key_order if k not in stale_set]
+
+    write_merged_csv(merged_csv_path, merged_rows_by_key, merged_key_order)
+    logger.debug(
+        "Merged CSV updated: %s | court=%s | rows_for_court=%d",
+        merged_csv_path,
+        court_name,
+        len(current_court_keys),
+    )
+    return merged_csv_path
 
 
 def extract_metadata_after_heading(anchor_tag, page_url: str) -> Tuple[str, str, str]:
@@ -630,6 +751,76 @@ def download_pdf(
     return False, ""
 
 
+def fetch_case_detail_html(
+    case_detail_url: str,
+    driver: webdriver.Chrome,
+    session: requests.Session,
+    logger: logging.Logger,
+) -> Tuple[str, str]:
+    if not case_detail_url:
+        return "", ""
+
+    sync_cookies_from_driver(driver, session)
+
+    try:
+        response = session.get(case_detail_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        html_text = response.text or ""
+        if "html" in content_type or "<html" in html_text.lower():
+            return response.url, html_text
+    except requests.RequestException as exc:
+        logger.debug("Case detail HTML request failed for %s: %s", case_detail_url, exc)
+
+    try:
+        driver.get(case_detail_url)
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        sync_cookies_from_driver(driver, session)
+        html_text = driver.page_source or ""
+        if html_text:
+            return driver.current_url, html_text
+    except TimeoutException:
+        logger.debug("Selenium timeout while loading case detail HTML: %s", case_detail_url)
+    except WebDriverException as exc:
+        logger.debug("Selenium failed while loading case detail HTML %s: %s", case_detail_url, exc)
+
+    return "", ""
+
+
+def save_case_detail_html(
+    case_detail_url: str,
+    target_html_path: Path,
+    driver: webdriver.Chrome,
+    session: requests.Session,
+    logger: logging.Logger,
+) -> Tuple[bool, bool]:
+    """
+    Returns:
+        (is_html_saved_now, is_html_already_exists)
+    """
+    if not case_detail_url:
+        return False, False
+
+    if target_html_path.exists() and target_html_path.stat().st_size > 0:
+        return False, True
+
+    target_html_path.parent.mkdir(parents=True, exist_ok=True)
+    final_url, html_text = fetch_case_detail_html(case_detail_url, driver, session, logger)
+    if not html_text:
+        return False, False
+
+    try:
+        tmp_path = target_html_path.with_suffix(target_html_path.suffix + ".part")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            f.write(html_text)
+        tmp_path.replace(target_html_path)
+        logger.debug("Case detail HTML source URL: %s", final_url or case_detail_url)
+        return True, False
+    except Exception as exc:
+        logger.warning("Failed to save case detail HTML for %s: %s", case_detail_url, exc)
+        return False, False
+
+
 def reconcile_key_if_needed(
     case_no: str,
     opinion_no: str,
@@ -700,6 +891,22 @@ def process_record(
     desired_pdf_rel = build_pdf_relative_path(case_no, opinion_no, row["filed_date"], row["case_caption"])
     desired_pdf_abs = base_dir / desired_pdf_rel
     desired_pdf_abs.parent.mkdir(parents=True, exist_ok=True)
+    desired_html_rel = build_case_html_relative_path(case_no, opinion_no, row["filed_date"], row["case_caption"])
+    desired_html_abs = base_dir / desired_html_rel
+
+    html_saved, html_already_exists = save_case_detail_html(
+        case_detail_url=case_detail_url,
+        target_html_path=desired_html_abs,
+        driver=driver,
+        session=session,
+        logger=logger,
+    )
+    if html_saved:
+        logger.info("Case detail HTML saved: %s", desired_html_rel)
+    elif html_already_exists:
+        logger.info("Case detail HTML already exists: %s", desired_html_rel)
+    else:
+        logger.warning("Case detail HTML not saved for: %s", case_detail_url or key)
 
     existing_rel = normalize_spaces(row.get("pdf_local_path", ""))
     existing_abs = base_dir / existing_rel if existing_rel else None
@@ -835,6 +1042,13 @@ def main() -> None:
                     finally:
                         # Persist progress one-by-one.
                         write_csv(csv_path, rows_by_key, key_order)
+                        sync_merged_csv_for_court(
+                            base_dir=output_base,
+                            court_rows_by_key=rows_by_key,
+                            court_key_order=key_order,
+                            court_name=COURT_NAME,
+                            logger=logger,
+                        )
 
                 next_page_url = extract_next_page_url_for_year(soup, next_page_url, year)
 
@@ -851,6 +1065,14 @@ def main() -> None:
 
         write_csv(csv_path, rows_by_key, key_order)
         logger.info("CSV written: %s", csv_path)
+        merged_csv_path = sync_merged_csv_for_court(
+            base_dir=output_base,
+            court_rows_by_key=rows_by_key,
+            court_key_order=key_order,
+            court_name=COURT_NAME,
+            logger=logger,
+        )
+        logger.info("Merged CSV written: %s", merged_csv_path)
 
         logger.info("Run summary")
         logger.info("Total pages visited: %d", pages_visited)
