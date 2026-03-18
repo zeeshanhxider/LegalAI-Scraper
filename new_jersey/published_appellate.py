@@ -5,7 +5,7 @@
 NJ Courts - Published Appellate Court Opinions scraper
 URL: https://www.njcourts.gov/attorneys/opinions/published-appellate
 
-CSV columns (as requested):
+CSV columns:
 - date
 - no
 - court
@@ -16,11 +16,12 @@ Also includes:
 - page_url
 - pdf_url
 - pdf_file
+- pdf_full_path
 - download_status
 
-Outputs:
-- download/published_appellate/published_appellate.csv
-- download/published_appellate/file/*.pdf
+Folder structure:
+- downloads/published_appellate/CSV/published_appellate.csv
+- downloads/published_appellate/<year>/<no>/<pdf file>.pdf
 """
 
 import csv
@@ -38,21 +39,23 @@ from bs4 import BeautifulSoup
 START_URL = "https://www.njcourts.gov/attorneys/opinions/published-appellate"
 BASE = "https://www.njcourts.gov"
 
-OUT_DIR = os.path.join("download", "published_appellate")
-FILES_DIR = os.path.join(OUT_DIR, "file")
-CSV_PATH = os.path.join(OUT_DIR, "published_appellate.csv")
+COURT_FOLDER = "published_appellate"
+
+BASE_DIR = os.path.join("downloads", COURT_FOLDER)
+CSV_DIR = os.path.join(BASE_DIR, "CSV")
+CSV_PATH = os.path.join(CSV_DIR, "published_appellate.csv")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36"
 PAGE_DELAY_SEC = 0.35
 
 MAX_PAGES = None   # set to 2 for testing
 MAX_ITEMS = None   # set to 50 for testing
-MAX_FILENAME_LEN = 150  # keep paths shorter for Windows MAX_PATH compatibility
+MAX_FILENAME_LEN = 150
 
 
 def ensure_dirs():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    os.makedirs(FILES_DIR, exist_ok=True)
+    os.makedirs(BASE_DIR, exist_ok=True)
+    os.makedirs(CSV_DIR, exist_ok=True)
 
 
 def clean_ws(s: str) -> str:
@@ -61,8 +64,8 @@ def clean_ws(s: str) -> str:
 
 def safe_filename(name: str, default="file", max_len: int = MAX_FILENAME_LEN) -> str:
     name = clean_ws(name)
-    name = re.sub(r"[^\w\-. ()\[\]/]+", "_", name)
-    name = name.replace("/", "_")
+    name = re.sub(r'[<>:"\\|?*]+', "_", name)
+    name = name.replace("/", "_").replace("\\", "_")
     name = name.strip("._ ")
     if not name:
         return default
@@ -79,6 +82,25 @@ def safe_filename(name: str, default="file", max_len: int = MAX_FILENAME_LEN) ->
     return f"{base[:keep]}{suffix}"
 
 
+def safe_folder_name(name: str, default="unknown") -> str:
+    name = clean_ws(name)
+    name = re.sub(r'[<>:"\\|?*]+', "_", name)
+    name = name.replace("/", "_").replace("\\", "_")
+    name = name.strip("._ ")
+    return name if name else default
+
+
+def extract_year(date_text: str) -> str:
+    if not date_text:
+        return "unknown_year"
+
+    m = re.search(r"\b(19|20)\d{2}\b", date_text)
+    if m:
+        return m.group(0)
+
+    return "unknown_year"
+
+
 def get_html(session: requests.Session, url: str, timeout=60) -> str:
     r = session.get(url, timeout=timeout)
     r.raise_for_status()
@@ -88,34 +110,33 @@ def get_html(session: requests.Session, url: str, timeout=60) -> str:
 def download_file(session: requests.Session, url: str, out_path: str, timeout=120) -> bool:
     if not url:
         return False
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return True
+
+    tmp = out_path + ".part"
     try:
         with session.get(url, stream=True, timeout=timeout, allow_redirects=True) as r:
             r.raise_for_status()
-            tmp = out_path + ".part"
             with open(tmp, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 128):
                     if chunk:
                         f.write(chunk)
-            os.replace(tmp, out_path)
+        os.replace(tmp, out_path)
         return True
     except Exception as e:
         print(f"   ⚠️ PDF download failed: {url} -> {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
         return False
 
 
 def parse_summary_from_card(card: BeautifulSoup) -> str:
-    """
-    Summary button example:
-      <button data-bs-target="#op-1007301-summary-arg-modal">
-
-    Modal is within the same card:
-      <div class="modal fade" id="op-1007301-summary-arg-modal">
-
-    Summary text is in:
-      .modal-body p
-    """
     btn = card.select_one("button[data-bs-target*='summary-arg-modal']")
     if not btn:
         return ""
@@ -138,8 +159,6 @@ def parse_summary_from_card(card: BeautifulSoup) -> str:
 
 
 def find_next_page_url(soup: BeautifulSoup, current_url: str) -> str:
-    # Pagination block:
-    # <nav class="njcourts-pager"> ... <a rel="next" href="?page=1">
     a = soup.select_one("nav.njcourts-pager a[rel='next']")
     if a and a.get("href"):
         return urljoin(current_url, a["href"].strip())
@@ -147,16 +166,6 @@ def find_next_page_url(soup: BeautifulSoup, current_url: str) -> str:
 
 
 def parse_cards(soup: BeautifulSoup, page_url: str):
-    """
-    Each item is in:
-      article.w-100 -> div.card.mb-3
-    PDF link in:
-      .card-title a.text-underline-hover[href]
-    Docket + Court in:
-      span.badge
-    Date in:
-      .small.text-muted
-    """
     cards = soup.select("article.w-100 div.card.mb-3")
     rows = []
 
@@ -170,7 +179,11 @@ def parse_cards(soup: BeautifulSoup, page_url: str):
         pdf_href = (title_a.get("href") or "").strip()
         pdf_url = urljoin(BASE, pdf_href) if pdf_href else ""
 
-        badges = [clean_ws(b.get_text(" ", strip=True)) for b in card.select("span.badge") if clean_ws(b.get_text())]
+        badges = [
+            clean_ws(b.get_text(" ", strip=True))
+            for b in card.select("span.badge")
+            if clean_ws(b.get_text())
+        ]
         no = badges[0] if len(badges) >= 1 else ""
         court = badges[1] if len(badges) >= 2 else ""
 
@@ -178,14 +191,20 @@ def parse_cards(soup: BeautifulSoup, page_url: str):
         date = clean_ws(date_el.get_text(" ", strip=True)) if date_el else ""
 
         description = parse_summary_from_card(card)
+        year = extract_year(date)
 
         pdf_file = ""
+        pdf_full_path = ""
+
         if pdf_url:
             base = os.path.basename(urlparse(pdf_url).path) or "opinion.pdf"
-            # make unique by adding docket number prefix
-            pdf_file = safe_filename(f"{no}_{base}" if no else base, default="opinion.pdf", max_len=MAX_FILENAME_LEN)
+            pdf_file = safe_filename(base, default="opinion.pdf", max_len=MAX_FILENAME_LEN)
             if not pdf_file.lower().endswith(".pdf"):
                 pdf_file += ".pdf"
+
+            docket_folder = safe_folder_name(no if no else "unknown_no")
+            pdf_dir = os.path.join(BASE_DIR, year, docket_folder)
+            pdf_full_path = os.path.join(pdf_dir, pdf_file)
 
         rows.append({
             "date": date,
@@ -196,9 +215,28 @@ def parse_cards(soup: BeautifulSoup, page_url: str):
             "page_url": page_url,
             "pdf_url": pdf_url,
             "pdf_file": pdf_file,
+            "pdf_full_path": pdf_full_path,
         })
 
     return rows
+
+
+def load_existing_pdf_urls(csv_path: str):
+    existing = set()
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return existing
+
+    try:
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                pdf_url = (row.get("pdf_url") or "").strip()
+                if pdf_url:
+                    existing.add(pdf_url)
+    except Exception as e:
+        print(f"⚠️ Failed to read existing CSV for dedupe: {e}")
+
+    return existing
 
 
 def main():
@@ -206,6 +244,8 @@ def main():
 
     session = requests.Session()
     session.headers.update({"User-Agent": UA})
+
+    existing_pdf_urls = load_existing_pdf_urls(CSV_PATH)
 
     file_exists = os.path.exists(CSV_PATH) and os.path.getsize(CSV_PATH) > 0
     csv_f = open(CSV_PATH, "a", newline="", encoding="utf-8")
@@ -220,9 +260,11 @@ def main():
             "page_url",
             "pdf_url",
             "pdf_file",
+            "pdf_full_path",
             "download_status",
         ],
     )
+
     if not file_exists:
         writer.writeheader()
         csv_f.flush()
@@ -231,6 +273,7 @@ def main():
     visited = set()
     page_count = 0
     item_count = 0
+    saved_count = 0
 
     while url:
         if url in visited:
@@ -249,21 +292,32 @@ def main():
 
         rows = parse_cards(soup, url)
         print(f" items found: {len(rows)}")
+
         if not rows:
             print("No items found. Stop.")
             break
 
         for r in rows:
+            item_count += 1
+
+            pdf_url = (r.get("pdf_url") or "").strip()
+            if pdf_url and pdf_url in existing_pdf_urls:
+                print(f"   Skipping duplicate: {pdf_url}")
+                continue
+
             status = "no-pdf"
-            if r["pdf_url"] and r["pdf_file"]:
-                out_path = os.path.join(FILES_DIR, r["pdf_file"])
-                ok = download_file(session, r["pdf_url"], out_path)
+            if r["pdf_url"] and r["pdf_full_path"]:
+                ok = download_file(session, r["pdf_url"], r["pdf_full_path"])
                 status = "pdf:ok" if ok else "pdf:fail"
 
             writer.writerow({**r, "download_status": status})
             csv_f.flush()
 
-            item_count += 1
+            if pdf_url:
+                existing_pdf_urls.add(pdf_url)
+
+            saved_count += 1
+
             if MAX_ITEMS is not None and item_count >= MAX_ITEMS:
                 print("Reached MAX_ITEMS. Stop.")
                 url = ""
@@ -281,9 +335,10 @@ def main():
 
     print("\n✅ DONE")
     print(f"CSV : {CSV_PATH}")
-    print(f"PDFs: {FILES_DIR}")
+    print(f"Base folder: {BASE_DIR}")
     print(f"Pages scraped: {page_count}")
-    print(f"Items scraped: {item_count}")
+    print(f"Items found: {item_count}")
+    print(f"Rows saved: {saved_count}")
 
 
 if __name__ == "__main__":
